@@ -69,7 +69,7 @@ The author adopts a two-stage training approach: first, pre-trained CNN is super
 
 ## Workflow
 
-![ChatGPT Image 2026年3月9日 20_18_18.png](Reading%20Note/2a848eb1-0096-43a4-b0a9-9fb80594af59.png)
+![ChatGPT Image 2026年3月9日 20_18_18.png](ReadingNoteImage/2a848eb1-0096-43a4-b0a9-9fb80594af59.png)
 
 ## Visualization, ablation and modes of error
 
@@ -148,7 +148,7 @@ solve the inefficiency and complexity of R-CNN and SPPnet based on region-based 
 
 ### Architecture and Training
 
-![截屏2026-03-12 12.56.25.png](Reading%20Note/%E6%88%AA%E5%B1%8F2026-03-12_12.56.25.png)
+![截屏2026-03-12 12.56.25.png](ReadingNoteImage/%E6%88%AA%E5%B1%8F2026-03-12_12.56.25.png)
 
 An input image and multiple regions of interest (RoIs) are input into a fully convolutional network. Each RoI is pooled into a fixed-size feature map and
 then mapped to a feature vector by fully connected layers (FCs). The network has two output vectors per RoI: softmax probabilities(k+1) and per-class bounding-box regression offsets(4). The architecture is trained end-to-end with a multi-task loss.
@@ -202,7 +202,7 @@ It is not the first method using learned proposal, but the first method that com
 
 ### Architecture
 
-![截屏2026-03-12 14.34.43.png](Reading%20Note/%E6%88%AA%E5%B1%8F2026-03-12_14.34.43.png)
+![截屏2026-03-12 14.34.43.png](ReadingNoteImage/%E6%88%AA%E5%B1%8F2026-03-12_14.34.43.png)
 
 It is composed of 2 modules.
 
@@ -231,7 +231,7 @@ It slides not on the original picture, but on its convolutional feature map.
 
 At each sliding-window location, RPN predict multiple k region proposals which are anchors. An anchor is  centered at the sliding window, and is associated with a scale and aspect ratio. By default the authors use 3 scales and 3 aspect ratios, yielding k=9 anchors at each sliding position. For each anchor, it outputs 2 objectness scores and 4 coordinates of the anchor.
 
-![截屏2026-03-12 14.56.10.png](Reading%20Note/%E6%88%AA%E5%B1%8F2026-03-12_14.56.10.png)
+![截屏2026-03-12 14.56.10.png](ReadingNoteImage/%E6%88%AA%E5%B1%8F2026-03-12_14.56.10.png)
 
 With anchor, the model doesn’t need multi-scale image pyramid and filter banks. The same feature map can cover targets of different sizes and shapes.
 
@@ -308,7 +308,7 @@ Each feature layer can produce a fixed set of detection predictions using a set 
 
 If the size of feature map is m*n, there are k default boxes at each position, and the number of categories is c, then this layer will output a total of (c+4)kmn values.
 
-![截屏2026-03-12 19.49.54.png](Reading%20Note/%E6%88%AA%E5%B1%8F2026-03-12_19.49.54.png)
+![截屏2026-03-12 19.49.54.png](ReadingNoteImage/%E6%88%AA%E5%B1%8F2026-03-12_19.49.54.png)
 
 The predictor of SSD is fully convolutional which doesn’t rely on the fully connected layer like YOLO. This is more flexible and easier to reuse on multiple scale feature maps.
 
@@ -469,6 +469,6 @@ consistent dual assignments →
 NMS-free, end-to-end | low-latency inference | It is most suitable for delay-sensitive systems, such as robot vehicles and edge real-time response. |
 | YOLOv11 | Make a balanced upgrade to the Ultralytics route | better efficiency and speed balance | It is most suitable for production-level projects that want something "newer, faster, and not too complicated". |
 
-![image.png](Reading%20Note/image.png)
+![image.png](ReadingNoteImage/image.png)
 
-![image.png](Reading%20Note/image%201.png)
+![image.png](ReadingNoteImage/image%201.png)
