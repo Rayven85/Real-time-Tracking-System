@@ -1,0 +1,6 @@
+path: /Users/zhaoxiaorong/Desktop/study/Real-time tracking system/TrackingSystem/datasets
+train: train/images
+val: valid/images
+
+nc: 4
+names: ['danger', 'mandatory', 'other', 'prohibitory']
