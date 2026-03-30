@@ -1,0 +1,2 @@
+model,mAP50,mAP50-95,precision,recall,weights
+yolov11n,0.8787592048405228,0.4406948631332578,0.8613403924501055,0.8425077793447014,runs\train\yolov11n\weights\best.pt
