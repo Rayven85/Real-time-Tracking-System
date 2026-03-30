@@ -1,2 +1,6 @@
 model,mAP50,mAP50-95,precision,recall,weights
-yolov11n,0.8787592048405228,0.4406948631332578,0.8613403924501055,0.8425077793447014,runs\train\yolov11n\weights\best.pt
+yolov5nu,0.85382,0.41975,0.93069,0.75494,runs/detect/runs/train/yolov5nu/weights/best.pt
+yolov8n,0.87251,0.44256,0.86024,0.83822,runs/detect/runs/train/yolov8n/weights/best.pt
+yolov9t,0.86198,0.43053,0.93949,0.76777,runs/detect/runs/train/yolov9t/weights/best.pt
+yolov10n,0.82018,0.40244,0.82256,0.78616,runs/detect/runs/train/yolov10n/weights/best.pt
+yolov11n,0.88073,0.43988,0.88308,0.80693,runs/detect/runs/train/yolov11n/weights/best.pt
