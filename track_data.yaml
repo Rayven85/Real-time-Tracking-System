@@ -1,0 +1,6 @@
+path: track_dataset
+train: images/train
+val:   images/val
+
+nc: 5
+names: ['stop', 'speed_55', 'light_off', 'light_green', 'light_red']
