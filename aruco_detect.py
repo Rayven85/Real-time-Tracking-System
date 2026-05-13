@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import time
 import os
+import threading
 
 # ── 畸变矫正开关 ──────────────────────────────────────────────────
 # GoPro Wide 在当前俯拍高度畸变极小，关闭矫正效果更好
@@ -56,9 +57,16 @@ ROI_STOP  = (305, 472, 402, 550)   # Bottom: STOP sign
 ROI_55    = (468, 283, 568, 362)   # Right: speed limit 55 sign
 
 # ── YOLO sign detection ──────────────────────────────────────────────
-SIGN_MODEL_PATH = "runs/detect/runs/train/track_signs/weights/best.pt"
-SIGN_CONF       = 0.20
-_sign_model     = None   # lazy-loaded on first detection frame
+SIGN_MODEL_PATH  = "runs/detect/runs/train/track_signs/weights/best.pt"
+SIGN_CONF        = 0.20
+SIGN_EVERY_N     = 8     # run YOLO once every N frames; reuse result in between
+_sign_model      = None
+_sign_cache      = {'light': 'OFF', 'stop': False, 'speed': False, 'boxes': []}
+_sign_frame_cnt  = 0
+_mask_running    = False   # True while background thread is computing track mask
+_mask_result     = [None]  # [0] holds the latest mask from the background thread
+_mask_M          = None    # M matrix used when last mask was computed
+MASK_REPRO_THR   = 15.0   # pixels — re-detect if any corner moves more than this
 
 
 def _get_sign_model():
@@ -84,23 +92,31 @@ def list_cameras(max_index=5):
     print()
 
 
-def open_camera(source):
-    """打开指定编号的摄像头"""
-    cap = cv2.VideoCapture(source, cv2.CAP_AVFOUNDATION)
-    if not cap.isOpened():
-        return None
-    # GoPro Webcam 在 Mac 上需要先丢弃几帧才能稳定
-    for _ in range(10):
-        cap.read()
-    ret, frame = cap.read()
-    if not ret or frame is None:
-        print(f"摄像头 [{source}] 打开但无法读取帧")
+def open_camera(source, retries=5):
+    """打开指定编号的摄像头，失败时自动重试（GoPro USB Webcam 在 Mac 上需要）"""
+    for attempt in range(1, retries + 1):
+        cap = cv2.VideoCapture(source, cv2.CAP_AVFOUNDATION)
+        if not cap.isOpened():
+            print(f"  [attempt {attempt}/{retries}] 驱动未就绪，3s 后重试…")
+            time.sleep(3.0)
+            continue
+
+        # 等硬件开始推流（GoPro 比普通摄像头慢）
+        time.sleep(2.0)
+
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"使用摄像头 [{source}]: {w}x{h}")
+            return cap
+
+        print(f"  [attempt {attempt}/{retries}] 推流未就绪，3s 后重试…")
         cap.release()
-        return None
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"使用摄像头 [{source}]: {w}x{h}")
-    return cap
+        time.sleep(3.0)
+
+    print(f"无法打开摄像头 {source}（已重试 {retries} 次）")
+    return None
 
 
 def build_undistort_maps(h, w):
@@ -205,25 +221,147 @@ def draw_raw(frame, markers, ids, corners):
     return out
 
 
-def capture_track_mask(warped_gray, threshold=80):
+def _perspective_changed(M_new):
+    """Return True if M_new differs from the stored _mask_M by more than MASK_REPRO_THR px."""
+    global _mask_M
+    if _mask_M is None or M_new is None:
+        return False
+    # Warp 4 image corners with both matrices and compare where they land
+    corners = np.array([[0, 0], [WARP_W, 0], [WARP_W, WARP_H], [0, WARP_H]],
+                       dtype=np.float32).reshape(-1, 1, 2)
+    p_old = cv2.perspectiveTransform(corners, _mask_M)
+    p_new = cv2.perspectiveTransform(corners, M_new)
+    max_shift = float(np.max(np.linalg.norm(p_new - p_old, axis=2)))
+    return max_shift > MASK_REPRO_THR
+
+
+def _bridge_sign_roi(mask, rx1, ry1, rx2, ry2, line_width=10):
     """
-    从没有 car 标记的俯视图中提取轨道掩膜并保存。
-    只需运行一次（按 'c' 触发）。
+    Replace the fat sticker blob inside a sign ROI with a thin bridging line.
+
+    Scans a strip outside each ROI edge to find where the track enters/exits,
+    clears the ROI interior, then connects the two most-separated entry/exit
+    points with a straight line (longest pair → avoids Y/T shapes).
     """
-    _, mask = cv2.threshold(warped_gray, threshold, 255, cv2.THRESH_BINARY_INV)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    cv2.imwrite("track_mask.png", mask)
-    print("轨道掩膜已保存: track_mask.png")
+    h, w = mask.shape
+    pad  = 18
+    candidates = []
+
+    strip = mask[max(0, ry1 - pad):ry1, rx1:rx2]
+    if strip.any():
+        cols = np.where(strip.any(axis=0))[0]
+        candidates.append((int(cols.mean()) + rx1, ry1))
+
+    strip = mask[ry2:min(h, ry2 + pad), rx1:rx2]
+    if strip.any():
+        cols = np.where(strip.any(axis=0))[0]
+        candidates.append((int(cols.mean()) + rx1, ry2))
+
+    strip = mask[ry1:ry2, max(0, rx1 - pad):rx1]
+    if strip.any():
+        rows = np.where(strip.any(axis=1))[0]
+        candidates.append((rx1, int(rows.mean()) + ry1))
+
+    strip = mask[ry1:ry2, rx2:min(w, rx2 + pad)]
+    if strip.any():
+        rows = np.where(strip.any(axis=1))[0]
+        candidates.append((rx2, int(rows.mean()) + ry1))
+
+    mask[ry1:ry2, rx1:rx2] = 0
+
+    if len(candidates) < 2:
+        return mask
+
+    best_d, best_pair = -1, (candidates[0], candidates[1])
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            dx = candidates[i][0] - candidates[j][0]
+            dy = candidates[i][1] - candidates[j][1]
+            d  = dx * dx + dy * dy
+            if d > best_d:
+                best_d, best_pair = d, (candidates[i], candidates[j])
+
+    cv2.line(mask, best_pair[0], best_pair[1], 255, line_width)
     return mask
+
+
+def auto_detect_track_mask(warped, car_pos=None):
+    """
+    Automatically segment the track from a 600×600 warped top-down view.
+
+    Approach:
+      1. Mask car ArUco only before Otsu (preserves track through sign areas).
+      2. Dual-polarity Otsu + morphological clean-up.
+      3. For the two sign ROIs (STOP, 55), replace the fat sticker blob with a
+         thin bridging line (_bridge_sign_roi).
+    """
+    img = warped.copy()
+
+    if car_pos is not None:
+        cv2.circle(img, (int(car_pos[0]), int(car_pos[1])), 40, (180, 180, 180), -1)
+
+    # ── Downsample to 300×300 for speed ──────────────────────────────
+    small   = cv2.resize(img, (WARP_W // 2, WARP_H // 2), interpolation=cv2.INTER_AREA)
+    gray    = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+
+    def _segment(thresh_type):
+        _, m = cv2.threshold(blurred, 0, 255, thresh_type + cv2.THRESH_OTSU)
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_close)
+        k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k_open)
+        min_area = (WARP_W // 2) * (WARP_H // 2) * 0.01
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out, kept = np.zeros_like(m), 0
+        for c in cnts:
+            if cv2.contourArea(c) >= min_area:
+                cv2.drawContours(out, [c], -1, 255, -1)
+                kept += 1
+        return out, kept
+
+    mask_inv, kept_inv = _segment(cv2.THRESH_BINARY_INV)
+    mask_nor, kept_nor = _segment(cv2.THRESH_BINARY)
+    ratio_inv = mask_inv.sum() / 255 / mask_inv.size
+    ratio_nor = mask_nor.sum() / 255 / mask_nor.size
+    TRACK_MIN, TRACK_MAX = 0.05, 0.70
+
+    def in_range(r):
+        return TRACK_MIN <= r <= TRACK_MAX
+
+    if   in_range(ratio_inv) and not in_range(ratio_nor):
+        clean_small, kept = mask_inv, kept_inv
+    elif in_range(ratio_nor) and not in_range(ratio_inv):
+        clean_small, kept = mask_nor, kept_nor
+    elif in_range(ratio_inv) and in_range(ratio_nor):
+        clean_small, kept = (mask_inv, kept_inv) if \
+            abs(ratio_inv - 0.30) <= abs(ratio_nor - 0.30) else (mask_nor, kept_nor)
+    else:
+        return None
+
+    # ── Upsample back to 600×600 ─────────────────────────────────────
+    clean = cv2.resize(clean_small, (WARP_W, WARP_H), interpolation=cv2.INTER_NEAREST)
+
+    # Replace sticker blobs in sign ROIs with thin bridging lines
+    for rx1, ry1, rx2, ry2 in [ROI_STOP, ROI_55]:
+        clean = _bridge_sign_roi(clean, rx1, ry1, rx2, ry2)
+
+    cv2.imwrite("track_mask.png", clean)
+    print(f"[Auto] Track mask detected ({kept} blob(s)) → track_mask.png")
+    return clean
 
 
 def is_on_track(saved_mask, wx, wy, check_r=20):
     """
     用预先保存的轨道掩膜检测 (wx, wy) 是否在轨道上。
-    saved_mask 是没有 car 标记时拍的，所以轨道完整无遮挡。
+    Sign ROI positions always count as on-track (the track passes under the signs).
     """
     global _track_history, _track_status
+
+    # Sign ROIs are on the track by definition — short-circuit mask check
+    for rx1, ry1, rx2, ry2 in [ROI_LIGHT, ROI_STOP, ROI_55]:
+        if rx1 <= wx <= rx2 and ry1 <= wy <= ry2:
+            return True
 
     x1 = max(0, wx - check_r);  x2 = min(WARP_W, wx + check_r)
     y1 = max(0, wy - check_r);  y2 = min(WARP_H, wy + check_r)
@@ -363,8 +501,25 @@ def draw_warped(frame, markers, M, saved_mask=None):
     cv2.putText(warped, "Top-Down View", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    # Sign detection HUD (top-right corner) + bounding boxes
-    signs = detect_signs(warped)
+    # Track mask status indicator (bottom-left)
+    if saved_mask is not None:
+        mask_text, mask_color = "TRACK: detected", (0, 220, 0)
+    elif _mask_running:
+        mask_text, mask_color = "TRACK: detecting...", (0, 165, 255)
+    else:
+        mask_text, mask_color = "TRACK: press c", (80, 80, 80)
+    cv2.putText(warped, mask_text, (10, WARP_H - 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+    cv2.putText(warped, mask_text, (10, WARP_H - 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, mask_color, 1)
+
+    # Sign detection: run YOLO every SIGN_EVERY_N frames, reuse cache otherwise
+    global _sign_cache, _sign_frame_cnt
+    _sign_frame_cnt += 1
+    if _sign_frame_cnt % SIGN_EVERY_N == 0:
+        _sign_cache = detect_signs(warped)
+
+    signs = _sign_cache
     light_color = {'GREEN': (0, 220, 0), 'RED': (0, 0, 255), 'OFF': (120, 120, 120)}
     hud_items = [
         (f"[LIGHT] {signs['light']}",
@@ -419,12 +574,11 @@ def main():
                         help="摄像头编号（不指定则列出所有摄像头）")
     args = parser.parse_args()
 
-    list_cameras()
-    time.sleep(1.0)   # give macOS time to fully release devices after scan
-
     if args.source is None:
+        # Only scan when user hasn't specified a source
+        list_cameras()
         print("请用 --source 指定摄像头编号，例如：")
-        print("  python aruco_detect.py --source 1")
+        print("  python aruco_detect.py --source 0")
         return
 
     cap = open_camera(args.source)
@@ -446,15 +600,49 @@ def main():
     frame_count = 0
     t_start = time.perf_counter()
     M = None
-    saved_mask = None  # 预先扫描保存的轨道掩膜
+    saved_mask = None   # auto-detected track mask
+    _M_stable_frames = 0
+    _first_detect_done = False
+    _read_failures = 0
+    _MAX_FAILURES = 300
+    def _run_mask_detection(warped_snap, car_pos_snap, M_snap):
+        """Run in a background thread — stores result in _mask_result[0]."""
+        global _mask_running, _mask_M
+        result = auto_detect_track_mask(warped_snap, car_pos_snap)
+        _mask_result[0] = result
+        if result is not None:
+            _mask_M = M_snap   # remember which perspective this mask was built for
+            print("✓ 轨道掩膜已更新")
+        else:
+            print("[Auto] 轨道识别失败，请检查光照或按 'c' 重试")
+        _mask_running = False
 
-    print("使用步骤: 1)先不放car标记，按'w'进入俯视图  2)按'c'捕获轨道  3)放上car标记")
-    print("标识检测: 'r'键显示ROI框，确认框住LIGHT/STOP/55后关闭")
+    def _trigger_mask(warped_now, markers_now):
+        """Snapshot current frame and kick off background detection (non-blocking)."""
+        global _mask_running
+        if _mask_running:
+            return
+        car_pos = None
+        if CAR_ID in markers_now:
+            cx, cy, _ = markers_now[CAR_ID]
+            car_pos = warp_point((cx, cy), M)
+        _mask_running = True
+        threading.Thread(target=_run_mask_detection,
+                         args=(warped_now.copy(), car_pos, M.copy()), daemon=True).start()
+
+    print("使用步骤: 按'w'进入俯视图 → 轨道自动识别（后台运行，不影响画面）")
+    print("'c'键可随时重新识别轨道  |  'r'显示ROI框  |  'm'显示掩膜")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            break
+            _read_failures += 1
+            if _read_failures >= _MAX_FAILURES:
+                print(f"摄像头连续丢帧 {_MAX_FAILURES} 次，退出")
+                break
+            cv2.waitKey(1)   # keep UI responsive, no sleep — GoPro needs continuous reads
+            continue
+        _read_failures = 0
 
         frame_count += 1
         elapsed = time.perf_counter() - t_start
@@ -495,6 +683,24 @@ def main():
         # 有4个角就更新透视矩阵
         if all(i in markers for i in [0, 1, 2, 3]):
             M = get_perspective_transform(markers)
+            _M_stable_frames += 1
+        else:
+            _M_stable_frames = 0
+
+        # Pick up mask result from background thread
+        if _mask_result[0] is not None:
+            saved_mask = _mask_result[0]
+            _mask_result[0] = None
+
+        # Auto-detect: first time corners are stable in warp mode, or perspective shifted
+        if show_warp and M is not None and not _mask_running and _M_stable_frames >= 30:
+            need_detect = (not _first_detect_done) or \
+                          (_first_detect_done and _perspective_changed(M))
+            if need_detect:
+                _first_detect_done = True
+                warped_now = cv2.warpPerspective(frame, M, (WARP_W, WARP_H))
+                saved_mask = None   # clear stale mask while new one computes
+                _trigger_mask(warped_now, markers)
 
         # 决定显示内容
         if show_warp and M is not None:
@@ -530,12 +736,13 @@ def main():
         elif key == ord('d'):
             show_distort_compare = True
         elif key == ord('c'):
-            # 捕获当前俯视图作为轨道掩膜（此时不要放 car 标记）
+            # Re-run auto track detection (car can be present — its position is masked out)
             if show_warp and M is not None:
                 warped_now = cv2.warpPerspective(frame, M, (WARP_W, WARP_H))
-                warped_gray = cv2.cvtColor(warped_now, cv2.COLOR_BGR2GRAY)
-                saved_mask = capture_track_mask(warped_gray)
-                print("✓ 轨道掩膜已捕获！现在可以放上 car 标记了")
+                _mask_result[0] = None
+                saved_mask = None
+                _trigger_mask(warped_now, markers)
+                print("轨道识别中（后台）…")
             else:
                 print("请先按 'w' 进入俯视图模式再按 'c'")
         elif key == ord('m'):
@@ -553,4 +760,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        cv2.destroyAllWindows()
+        print("\n已退出")
