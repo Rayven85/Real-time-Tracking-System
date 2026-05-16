@@ -1,15 +1,8 @@
 # Software Architecture — Real-time Vehicle Tracking System
-# 软件架构文档 — 实时车辆追踪系统
 
-> **Student / 学生:** Rayven85 &nbsp;|&nbsp; **Supervisor / 导师:** Akshat &nbsp;|&nbsp; **Period / 周期:** March – May 2026
-
----
-
-## System Architecture / 系统架构
+## System Architecture
 
 The system is a single-process Python application running on Mac (development) and targeting Nvidia Jetson Orin (deployment). All computation happens locally — no network required. The main loop in `core/aruco_detect.py` drives everything; a daemon thread handles the slow track-mask computation without blocking the video stream.
-
-系统是一个单进程 Python 应用，开发环境为 Mac，目标部署平台为 Nvidia Jetson Orin，所有计算均在本地完成。主循环位于 `core/aruco_detect.py`，一个守护线程负责耗时的轨道掩膜计算，不阻塞视频流。
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -58,7 +51,7 @@ The system is a single-process Python application running on Mac (development) a
 
 ### Layer Map / 层级模块对应
 
-| Layer / 层级 | Technology / 技术 | File / 文件 |
+| Layer | Technology | File |
 |---|---|---|
 | Camera capture | `cv2.VideoCapture` + `CAP_AVFOUNDATION` | `core/aruco_detect.py` |
 | Marker detection | `cv2.aruco` DICT_4X4_50 | `core/aruco_detect.py` |
@@ -78,11 +71,9 @@ The system is a single-process Python application running on Mac (development) a
 
 ---
 
-## Project Structure / 项目结构
+## Project Structure
 
 All scripts use `ROOT = Path(__file__).resolve().parent.parent` to anchor paths to the project root, so they work correctly regardless of the calling directory.
-
-所有脚本均通过 `ROOT = Path(__file__).resolve().parent.parent` 将路径锚定到项目根目录，从任意目录调用均可正确运行。
 
 ```
 TrackingSystem/
@@ -111,11 +102,9 @@ TrackingSystem/
 
 ---
 
-### `core/` — Main System / 核心系统
+### `core/` — Main System
 
 The entry point of the entire project. Contains two scripts.
-
-整个项目的入口，包含两个脚本。
 
 **`aruco_detect.py`** (768 lines) — The real-time pipeline. All major subsystems live here:
 
@@ -147,11 +136,9 @@ The entry point of the entire project. Contains two scripts.
 
 ---
 
-### `training/` — Model Training & Data Labelling / 模型训练与数据标注
+### `training/` — Model Training & Data Labelling 
 
 **`train.py`** (127 lines) — Trains all five YOLO variants on the GTSDB dataset in one run, then writes a comparison CSV to `runs/comparison_results.csv`.
-
-对五种 YOLO 变体统一训练，输出对比 CSV。
 
 ```
 Usage: python training/train.py --models yolov8n yolov11n --epochs 100
@@ -161,8 +148,6 @@ Base weights are loaded from `weights/`. Trained weights are saved to `runs/trai
 
 **`train_track.py`** (86 lines) — Fine-tunes `weights/yolo11n.pt` on the track-specific sign dataset (`track_dataset/`). Outputs to `runs/train/track_signs/`.
 
-基于 `weights/yolo11n.pt` 对赛道专用标志数据集进行微调。
-
 ```
 Usage: python training/train_track.py --epochs 50
 ```
@@ -171,11 +156,7 @@ Key parameters: 5 classes (stop / speed_55 / light_off / light_green / light_red
 
 **`auto_label.py`** (307 lines) — Semi-automatic YOLO label generator for the 600×600 warped screenshots.
 
-半自动 YOLO 标注工具，用于 600×600 俯视截图。
-
 Pipeline: Load screenshot → HSV auto-detection in 3 ROIs → display bounding boxes → keyboard adjustments → save YOLO `.txt` label.
-
-流程：读入截图 → 三个 ROI 内 HSV 自动检测 → 显示边界框 → 键盘调整 → 保存 YOLO `.txt` 标注。
 
 | Key | Action |
 |---|---|
@@ -189,19 +170,15 @@ Reads from `track_dataset/images/<split>/`, writes labels to `track_dataset/labe
 
 **`debug_yolo.py`** (94 lines) — Diagnostic tool. Loads one training image, runs the model at conf=0.05, prints every detection with ROI membership, and saves crops to `runs/`. Used to diagnose the domain mismatch issue (cropped ROI input vs full-image input).
 
-诊断工具，用于定位域不匹配问题（ROI 裁剪输入 vs 全图推理）。
-
 ```
 Usage: python training/debug_yolo.py [--img path/to/image.jpg]
 ```
 
 ---
 
-### `evaluation/` — Model Evaluation & Visualisation / 模型评估与可视化
+### `evaluation/` — Model Evaluation & Visualisation
 
 **`evaluate.py`** (142 lines) — Runs `model.val()` on the test split for each trained model, outputs a CSV to `runs/evaluation/test_results.csv`. Optionally generates bar charts (`--plot`).
-
-对每个训练好的模型执行测试集评估，输出 CSV，可选生成柱状图。
 
 ```
 Usage: python evaluation/evaluate.py [--plot]
@@ -209,19 +186,13 @@ Usage: python evaluation/evaluate.py [--plot]
 
 **`benchmark.py`** (214 lines) — Measures model efficiency (parameter count, GFLOPs, model size, CPU latency, FPS) separately from accuracy. Merges lightweight results with accuracy results from `collect_results.py` into `runs/comparison_results_full.csv`.
 
-独立测量模型效率（参数量、GFLOPs、体积、CPU延迟、FPS），与精度结果合并输出。
-
 ```
 Usage: python evaluation/benchmark.py [--models yolov8n yolov11n] [--runs 100]
 ```
 
 **`collect_results.py`** (74 lines) — Reads the per-epoch `results.csv` from each model's training directory, extracts the best-epoch row, and writes a unified `runs/comparison_results.csv`. Run automatically at the end of `train.py`, or manually after training.
 
-从各模型训练目录中提取最优 epoch 指标，合并为统一 CSV。
-
 **`visualize.py`** (265 lines) — Generates side-by-side GT vs prediction images. Three output modes:
-
-生成真实框与预测框的并排对比图，三种输出模式：
 
 | Mode | Output | Use |
 |---|---|---|
@@ -235,19 +206,15 @@ Usage: python evaluation/visualize.py --mode grid --n 10 --seed 42
 
 **`predict.py`** (77 lines) — Runs inference on a single model or all models in parallel on a given source (image dir, video, webcam). Saves annotated results to `runs/predict/<model>/`.
 
-对单个或所有模型执行推理，结果保存至 `runs/predict/<model>/`。
-
 ```
 Usage: python evaluation/predict.py --compare --source datasets/test/images
 ```
 
 ---
 
-### `camera/` — Camera Tools & Calibration / 相机工具与标定
+### `camera/` — Camera Tools & Calibration
 
 **`calibrate_gopro.py`** (161 lines) — Two-phase checkerboard calibration tool.
-
-两阶段棋盘格标定工具。
 
 - Phase 1 (first run): generates `calib_images/calibration_checkerboard.png` for printing
 - Phase 2 (after photos collected): calls `cv2.calibrateCamera()` on images in `calib_images/`, saves result to `calib_images/gopro_calib.npz`
@@ -256,23 +223,13 @@ Target reprojection error: < 1.0 px.
 
 **`undistort.py`** (214 lines) — Interactive distortion correction tuner. Displays original vs corrected side by side with a green grid overlay. Three sliders: K1 (primary barrel), K2 (higher-order), focal scale.
 
-交互式畸变校正调参工具，实时左右对比，绿色网格叠加。
-
 Supports three modes: `--mode wide` (GoPro Wide), `--mode superview` (GoPro SuperView), `--mode rpi` (Raspberry Pi fisheye via `cv2.fisheye`). Manual estimate: k1 = −0.462, k2 = −0.054 — currently disabled in `aruco_detect.py` as overhead distortion is negligible.
-
-目前 `aruco_detect.py` 中畸变校正已关闭，因为当前俯拍高度下 Wide 模式畸变可忽略。
 
 **`gopro_distortion.py`** (162 lines) — Compares distortion across GoPro FOV modes. Overlays a green grid on sample images from `gopro_samples/{linear,wide,superview}/`, uses Hough line detection to score straightness, outputs `fov_comparison.jpg`.
 
-对比 GoPro 三种 FOV 模式的畸变程度，输出网格叠加对比图。
-
 **`gopro_latency.py`** (160 lines) — Measures GoPro USB Webcam streaming performance: actual FPS vs declared FPS, frame interval jitter, dropped frame detection. Renders a scrolling bar chart of frame intervals in real time.
 
-测量 GoPro USB Webcam 的实际帧率、帧间隔抖动和丢帧情况，实时渲染帧间隔柱状图。
-
 **`test.py`** (220 lines) — Multi-mode camera and model testing suite:
-
-多模式摄像头与模型测试工具：
 
 | Mode | What it does |
 |---|---|
@@ -287,11 +244,9 @@ Usage: python camera/test.py --mode fps_test --model weights/yolov8n.pt
 
 ---
 
-### `tracking/` — Object Tracking / 目标追踪
+### `tracking/` — Object Tracking
 
 **`track.py`** (141 lines) — Real-time multi-object tracking using YOLO + ByteTrack (built into Ultralytics). Maintains trajectory history (last 30 frames per ID) and draws alpha-blended trail lines (older = dimmer). Supports video file input or webcam.
-
-使用 YOLO + ByteTrack 实现实时多目标追踪，维护每个 ID 最近 30 帧的轨迹，绘制透明度渐变轨迹线（越旧越淡）。
 
 ```
 Usage: python tracking/track.py [--source 0] [--conf 0.4] [--save]
@@ -301,11 +256,9 @@ Output video saved to `runs/track_output.mp4` when `--save` is passed.
 
 ---
 
-### `weights/` — Pretrained YOLO Weights / 预训练权重
+### `weights/` — Pretrained YOLO Weights
 
 ImageNet-pretrained base weights. Used as starting points for training — never used for inference directly.
-
-ImageNet 预训练基础权重，仅作为训练起点，不直接用于推理。
 
 | File | Used by |
 |---|---|
@@ -317,11 +270,9 @@ ImageNet 预训练基础权重，仅作为训练起点，不直接用于推理�
 
 Trained weights (after running `train.py` / `train_track.py`) are stored separately in `runs/train/<model>/weights/best.pt`.
 
-训练完成的权重单独存放于 `runs/train/<model>/weights/best.pt`，不覆盖此处的基础权重。
-
 ---
 
-### `calib_images/` — Camera Calibration Data / 相机标定数据
+### `calib_images/` — Camera Calibration Data
 
 | File | Description |
 |---|---|
@@ -333,21 +284,17 @@ The `.npz` output from calibration is available for loading by `aruco_detect.py`
 
 ---
 
-### `datasets/` — GTSDB Evaluation Data / GTSDB评估数据
+### `datasets/` — GTSDB Evaluation Data
 
 German Traffic Sign Detection Benchmark subset, YOLO format, 4 classes: `danger / mandatory / other / prohibitory`.
-
-德国交通标志检测基准数据集子集，YOLO 格式，4 类。
 
 Used by `evaluation/evaluate.py`, `evaluation/benchmark.py`, `evaluation/visualize.py`, and `evaluation/predict.py` for test-set evaluation.
 
 ---
 
-### `track_dataset/` — Custom Track Sign Dataset / 赛道标志专用数据集
+### `track_dataset/` — Custom Track Sign Dataset
 
 600×600 px warped-view screenshots of the physical race track, labelled with YOLO format annotations.
-
-600×600 px 赛道俯视截图，YOLO 格式标注。
 
 ```
 track_dataset/
@@ -361,11 +308,9 @@ track_dataset/
 
 5 classes: `stop / speed_55 / light_off / light_green / light_red`. Created by: run `core/aruco_detect.py`, press `s` to capture screenshots, then run `training/auto_label.py`.
 
-5 个类别：`stop / speed_55 / light_off / light_green / light_red`。
-
 ---
 
-### `gopro_samples/` — FOV Comparison Photos / FOV 对比照片
+### `gopro_samples/` — FOV Comparison Photos
 
 ```
 gopro_samples/
@@ -378,27 +323,21 @@ Used by `camera/gopro_distortion.py` and `camera/undistort.py`.
 
 ---
 
-### `markers/` — Generated ArUco PNGs / 生成的ArUco标记图
+### `markers/` — Generated ArUco PNGs
 
 Output from `core/generate_markers.py`. 5 files: `corner_0.png` through `corner_3.png` and `car.png`. Print at 4–6 cm for corner markers, 3–4 cm for car marker.
 
-`core/generate_markers.py` 的输出。桌角标记建议打印 4–6 cm，车顶标记建议 3–4 cm。
-
 ---
 
-### `screenshots/` — Runtime Detection Screenshots / 运行时截图
+### `screenshots/` — Runtime Detection Screenshots
 
 Saved by pressing `s` in `core/aruco_detect.py`. Named sequentially `aruco_001.jpg`, `aruco_002.jpg`, … These are the source images for `training/auto_label.py`.
 
-在 `core/aruco_detect.py` 运行时按 `s` 保存，顺序命名。这些图片是 `training/auto_label.py` 的输入来源。
-
 ---
 
-### `runs/` — Training & Evaluation Outputs / 训练与评估输出
+### `runs/` — Training & Evaluation Outputs
 
 All output from training, evaluation, and inference scripts is written here. Never committed manually — all generated at runtime.
-
-所有训练、评估、推理脚本的输出均写入此目录，运行时自动生成。
 
 ```
 runs/
@@ -421,7 +360,7 @@ runs/
 
 ---
 
-### `docs/` — Project Documentation / 项目文档
+### `docs/` — Project Documentation
 
 | File / Folder | Content |
 |---|---|
@@ -432,15 +371,13 @@ runs/
 
 ---
 
-## Development Timeline / 开发历程
+## Development Timeline
 
-### Week 3–5: YOLO Model Baseline Comparison / YOLO 模型基准对比
+### Week 3–5: YOLO Model Baseline Comparison
 
 **Dataset:** GTSDB (German Traffic Sign Detection Benchmark), YOLO format, 4 classes.
 
 Five nano-scale YOLO variants trained for 100 epochs each on identical hardware:
-
-五种轻量 YOLO 变体在相同硬件上各训练 100 epoch：
 
 | Model | mAP50 | mAP50-95 | Precision | Recall | Params (M) | GFLOPs | Latency (ms) | FPS |
 |---|---|---|---|---|---|---|---|---|
@@ -452,13 +389,11 @@ Five nano-scale YOLO variants trained for 100 epochs each on identical hardware:
 
 **Decision:** YOLOv11n — highest mAP50, lowest latency (59.1 ms), fewest GFLOPs.
 
-**结论：** YOLOv11n 综合最优，mAP50 最高、延迟最低、GFLOPs 最少。
-
 ---
 
-### Week 5–7: Camera, Calibration & Marker System / 相机、标定与标记系统
+### Week 5–7: Camera, Calibration & Marker System
 
-#### Camera Selection / 相机选型
+#### Camera Selection
 
 Initial Logitech USB webcam (1280×720 @ 24 FPS) couldn't cover the full table even at maximum mount height — fixed focal length, insufficient FOV. Replaced with GoPro in USB Webcam mode.
 
@@ -470,7 +405,7 @@ GoPro USB Webcam mode supports three FOV modes:
 | **Wide** | Slight barrel | ✓ | **Selected** |
 | SuperView | Severe barrel | ✓ | Rejected |
 
-#### Distortion Correction / 畸变校正
+#### Distortion Correction
 
 `camera/undistort.py` — Interactive tool: side-by-side original vs corrected with green grid overlay, three sliders (K1, K2, focal scale). Manual estimate: **k1 = −0.462, k2 = −0.054**.
 
@@ -478,9 +413,7 @@ GoPro USB Webcam mode supports three FOV modes:
 
 At the current overhead mount height, Wide mode barrel distortion is negligible — manually estimated correction worsened the image. **Distortion correction is currently disabled** in `aruco_detect.py`.
 
-当前俯拍高度下 Wide 模式畸变极小，手动估算的校正参数反而使图像变差，因此 `aruco_detect.py` 中畸变校正目前**关闭**。
-
-#### ArUco vs AprilTag / 标记系统选型
+#### ArUco vs AprilTag
 
 | | AprilTag | **ArUco (selected)** |
 |---|---|---|
@@ -491,33 +424,24 @@ At the current overhead mount height, Wide mode barrel distortion is negligible 
 
 Dictionary: `DICT_4X4_50` — simplest pattern (16 data bits), easiest to detect at close overhead range.
 
-#### Perspective Warp / 透视变换
+#### Perspective Warp
 
 The oblique camera angle produces a trapezoidal view. Once the four corner markers (IDs 0–3) are detected, `cv2.getPerspectiveTransform` computes homography matrix `M`. Each frame is warped into a **600×600 px orthographic top-down view**. `M` is recomputed every frame — minor camera movement is automatically compensated.
 
-每帧重新计算单应性矩阵 `M`，摄像机轻微晃动自动补偿，输出为 **600×600 px 正射俯视图**。
-
-#### ON / OFF TRACK Detection / 在轨判断
+#### ON / OFF TRACK Detection
 
 **Problem:** The ArUco marker on the car physically covers the track beneath it. Real-time pixel sampling at the car's position reads the marker pattern, not the track — always reports OFF TRACK.
 
-**车顶 ArUco 标记遮住车下赛道，实时像素采样始终读到标记图案而非赛道，导致永远判断为"出轨"。**
-
 **Solution:** Before placing the car, press `c` to trigger `auto_detect_track_mask()` on the clean (car-free) warped view. The result is saved to `track_mask.png`. All subsequent queries check this pre-saved mask, not the live image.
 
-**方案：** 放车前触发一次自动掩膜检测，将干净的掩膜保存为 `track_mask.png`，后续判断均查询此预存掩膜。
 
 **Debounce:** 8-frame rolling window, >60% majority required to update ON/OFF state. Prevents flickering when the car drives near the track edge.
 
-**防抖：** 8 帧滚动窗口，超过 60% 同意才更新状态，消除边缘抖动。
-
 ---
 
-### Week 7–9: Custom YOLO Sign Detection / 赛道标志检测
+### Week 7–9: Custom YOLO Sign Detection
 
 Three stages of development:
-
-开发经历三个阶段：
 
 **Stage 1 — HSV colour thresholds (abandoned):** Fixed ROI regions + red/green pixel ratio thresholds. Brittle to lighting changes; LED colour boundaries ambiguous; ROI coordinate calibration tedious. Abandoned.
 
@@ -526,8 +450,6 @@ Three stages of development:
 **Stage 3 — Bootstrap custom training (successful):**
 
 Bootstrap strategy: use imprecise HSV detections as an annotation seed → refine manually with `auto_label.py` → train YOLO from scratch on track-domain images.
-
-**自举策略：** 用 HSV 检测作为标注种子 → `auto_label.py` 人工微调 → 在赛道域图像上从头训练 YOLO。
 
 Dataset: 44 training + 12 validation images (600×600 px warped screenshots). 5 classes:
 
@@ -547,8 +469,6 @@ First attempt sent each ROI crop individually to YOLO. The model was trained on 
 
 **Fix:** Send the **complete 600×600 warped image** to YOLO, then filter detections by ROI centre position:
 
-**修复：** 发送完整 600×600 俯视图给 YOLO，再按检测框中心是否落在 ROI 内过滤：
-
 ```python
 for box, c, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
     bx = float((box[0] + box[2]) / 2)
@@ -561,15 +481,11 @@ Immediate result: `stop=0.907, light_off=0.825, speed_55=0.475`.
 
 **Frame-skip caching:** YOLO CPU inference ≈ 100–300 ms/call. Running every frame → ~5 FPS. Solution: run every 8th frame, cache the result for intermediate frames → **~25 FPS**.
 
-**帧跳缓存：** 每 8 帧推理一次，中间帧复用缓存，帧率从 ~5 FPS 恢复至 **~25 FPS**。
-
 ---
 
-### Week 9–11: Automatic Track Mask Detection / 自动轨道识别
+### Week 9–11: Automatic Track Mask Detection
 
 Previously required manual `c` keypress. Supervisor required full automation with adaptive re-detection.
-
-原需手动按键，导师要求全自动并在视角改变时自适应重检测。
 
 **Pipeline:**
 
@@ -581,17 +497,11 @@ raw frame → perspective warp (600×600) → downsample (300×300)
 
 **Dual-polarity Otsu:** Standard Otsu only tries one binary direction. Track polarity (dark-on-light vs light-on-dark) can vary across setups. Both directions are tried; the one with a white-pixel ratio closest to 30% (typical oval track) is selected. No manual threshold needed.
 
-**双极性 Otsu：** 两种二值化方向都尝试，选择白色像素比例最接近 30%（典型椭圆轨道）的方向，无需手动设阈值。
-
 **Half-resolution processing:** Detection runs at 300×300 (75% fewer pixels), upscaled to 600×600. Reduces CPU time enough to run in a background daemon thread without blocking the main loop.
-
-**半分辨率处理：** 在 300×300 下检测（像素减少 75%），上采样回 600×600，计算量足够低以在后台线程中运行。
 
 **`_bridge_sign_roi()` — sticker occlusion fix:**
 
 Black adhesive stickers under the three road signs match the track colour. Otsu classifies them as track; morphological close expands them into thick rectangular blobs. Four approaches were tried:
-
-三处路标底部黑色贴纸与轨道同色，Otsu 误判为轨道像素。尝试了四种方案：
 
 | Version | Strategy | Outcome |
 |---|---|---|
@@ -601,8 +511,6 @@ Black adhesive stickers under the three road signs match the track colour. Otsu 
 | v4 | Skeletonisation + branch pruning | Complete failure — edge truncation erodes inward |
 
 Current solution (v3): clear ROI interior, find the two most-distant track entry points on the ROI perimeter, connect with one straight line (avoids Y/T junctions).
-
-当前方案（v3）：清除 ROI 内所有像素，在 ROI 外缘找到最远两个入射点，连一条直线（避免 Y/T 形伪影）。
 
 **Non-blocking background thread:**
 
@@ -620,17 +528,13 @@ if _mask_result[0] is not None:
 
 **Perspective change re-detection:** The homography matrix `_mask_M` from the last detection is stored. Each frame, all four image corners are projected through both `_mask_M` and the current `M`. If any corner shifts more than **15 px**, re-detection is triggered.
 
-**视角变化重检测：** 对比上次检测时的透视矩阵 `_mask_M` 与当前矩阵，四角点位移超过 **15 px** 即触发重检测。
-
 **ROI short-circuit in `is_on_track()`:** When the car is within a sign ROI zone (where stickers can cause mask gaps), the function returns `True` immediately without querying the mask — these zones are always on-track by construction.
-
-**ROI 短路：** 当小车位于标志 ROI 区域内时（贴纸可能导致掩膜断裂），`is_on_track()` 直接返回 `True`，不查询掩膜。
 
 ---
 
-## Key Technical Decisions / 关键技术决策
+## Key Technical Decisions
 
-| Decision / 决策 | Rationale / 原因 | Alternative Rejected / 被否定方案 |
+| Decision | Rationale | Alternative Rejected |
 |---|---|---|
 | GoPro over Logitech | Wide FOV covers full table from single overhead mount | Logitech: fixed focal length, insufficient FOV even at max height |
 | Wide FOV (not Linear) | Linear unavailable in USB Webcam mode | Linear: offline-only, unavailable for real-time streaming |
@@ -647,9 +551,9 @@ if _mask_result[0] is not None:
 
 ---
 
-## Results Summary / 实验结果汇总
+## Results Summary
 
-### YOLO Model Comparison — GTSDB / YOLO 模型对比
+### YOLO Model Comparison — GTSDB
 
 | Model | mAP50 ↑ | mAP50-95 ↑ | Latency (ms) ↓ | FPS ↑ | Params (M) ↓ |
 |---|---|---|---|---|---|
@@ -659,7 +563,7 @@ if _mask_result[0] is not None:
 | YOLOv10n | 0.820 | 0.402 | 85.8 | 11.7 | 2.71 |
 | **YOLOv11n ✓** | **0.881** | **0.440** | **59.1** | **16.9** | 2.59 |
 
-### Custom Track Sign Model / 赛道专用模型
+### Custom Track Sign Model
 
 | Metric | Value |
 |---|---|
@@ -670,7 +574,7 @@ if _mask_result[0] is not None:
 | Training set | 44 images |
 | Validation set | 12 images |
 
-### Runtime Performance / 实时性能
+### Runtime Performance
 
 | Component | FPS / Latency |
 |---|---|
