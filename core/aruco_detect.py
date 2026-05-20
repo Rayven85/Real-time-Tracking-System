@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import time
 import os
+import signal
 import threading
 from pathlib import Path
 
@@ -42,6 +43,9 @@ CAR_ID = 4
 # 矫正后输出画面大小
 WARP_W, WARP_H = 600, 600
 
+# 轨道掩膜均匀化：骨架线 + 固定宽度膨胀
+TRACK_HALF_WIDTH = 14   # px — final uniform half-width in the 600×600 mask
+
 # ON/OFF TRACK 防抖：连续 N 帧一致才切换
 DEBOUNCE_FRAMES = 8
 _track_history = []   # 最近N帧的判断结果
@@ -61,7 +65,7 @@ ROI_55    = (468, 283, 568, 362)   # Right: speed limit 55 sign
 
 # ── YOLO sign detection ──────────────────────────────────────────────
 SIGN_MODEL_PATH  = str(ROOT / "runs/detect/runs/train/track_signs/weights/best.pt")
-SIGN_CONF        = 0.20
+SIGN_CONF        = 0.05
 SIGN_EVERY_N     = 8     # run YOLO once every N frames; reuse result in between
 _sign_model      = None
 _sign_cache      = {'light': 'OFF', 'stop': False, 'speed': False, 'boxes': []}
@@ -70,6 +74,7 @@ _mask_running    = False   # True while background thread is computing track mas
 _mask_result     = [None]  # [0] holds the latest mask from the background thread
 _mask_M          = None    # M matrix used when last mask was computed
 MASK_REPRO_THR   = 15.0   # pixels — re-detect if any corner moves more than this
+_dynamic_sign_rois = []    # (x1,y1,x2,y2) boxes in warped 600×600 space; set by mask thread
 
 
 def _get_sign_model():
@@ -288,15 +293,160 @@ def _bridge_sign_roi(mask, rx1, ry1, rx2, ry2, line_width=10):
     return mask
 
 
-def auto_detect_track_mask(warped, car_pos=None):
+def _extract_track_ring(mask):
+    """
+    Find the largest ring-shaped region in a binary mask.
+
+    Why gaps break naive ring detection:
+      If the ring has any gap (missing segment, sign cutout, faint area), the
+      track centre is topologically connected to the exterior background, so
+      RETR_CCOMP never finds a parent-child pair → score = 0.
+
+    Fix: apply a large MORPH_CLOSE (radius ~90 px on 600×600) to seal every
+    gap before the topology check.  The sealed ring is used only to LOCATE the
+    ring; the output is drawn from those sealed contours so that gaps are
+    bridged.  The skeleton step that follows re-centres and normalises width,
+    so artificially filled gaps don't survive into the final mask.
+
+    Criteria for a valid ring (on the sealed mask):
+      - outer contour encloses ≥ 8 % of image
+      - band area (outer − hole)  in [4 %, 55 %]  ← the track strip
+      - interior hole             ≥ 8 % of image  ← the track centre
+    Score = hole_area / image_size.
+    """
+    # After perspective warp the track runs very close to the image borders.
+    # findContours treats border-touching white regions as open (no closed outer
+    # contour), so RETR_CCOMP never finds the parent-child hierarchy that
+    # signals a ring.  Adding a black border forces the track's outer edge to
+    # be fully enclosed within the image → proper ring topology.
+    PAD = 10
+    h, w = mask.shape
+    padded = cv2.copyMakeBorder(mask, PAD, PAD, PAD, PAD,
+                                cv2.BORDER_CONSTANT, value=0)
+
+    k_seal = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))
+    sealed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, k_seal)
+
+    cnts, hier = cv2.findContours(sealed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hier is None:
+        return np.zeros_like(mask), 0.0
+    hier = hier[0]
+    total = float(mask.size)
+    best_score, best_outer, best_children = 0.0, None, []
+
+    for i in range(len(cnts)):
+        if hier[i][3] != -1:          # skip inner contours
+            continue
+        outer_area = cv2.contourArea(cnts[i])
+        if outer_area < total * 0.08:
+            continue
+
+        children, hole_area = [], 0.0
+        ci = hier[i][2]
+        while ci != -1:
+            ha = cv2.contourArea(cnts[ci])
+            hole_area += ha
+            children.append(cnts[ci])
+            ci = hier[ci][0]          # next sibling
+
+        band_area = outer_area - hole_area
+        if not (total * 0.04 <= band_area <= total * 0.55 and hole_area >= total * 0.08):
+            continue
+
+        score = hole_area / total
+        if score > best_score:
+            best_score = score
+            best_outer, best_children = cnts[i], children
+
+    if best_outer is None:
+        return np.zeros_like(mask), 0.0
+
+    # Draw ring on padded canvas, then crop back to original size.
+    # Contour coords are in padded space, so the crop recovers the 600×600 ring.
+    ring_padded = np.zeros_like(padded)
+    cv2.drawContours(ring_padded, [best_outer], -1, 255, -1)
+    for c in best_children:
+        cv2.drawContours(ring_padded, [c], -1, 0, -1)
+    ring = ring_padded[PAD:PAD + h, PAD:PAD + w]
+    return ring, best_score
+
+
+def _smooth_ring_contours(mask, sigma=12):
+    """
+    Remove small bumps (sign stickers, tape) from a ring mask by Gaussian-
+    smoothing the outer and inner contour coordinates in-place (circular /
+    wrap-around boundary so the closed loop is treated correctly).
+
+    Why Gaussian instead of convex hull:
+      Convex hull is GLOBAL — a single downward bump (e.g. STOP sticker) pulls
+      the entire hull boundary downward, shifting the reconstructed ring ≥50 px.
+      Gaussian smoothing is LOCAL: sigma=12 removes bumps ≤ ~30 px arc length
+      while leaving the rounded corners (arc length ~100-150 px) intact.
+    """
+    cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    if hier is None or len(cnts) == 0:
+        return mask
+    hier = hier[0]
+
+    # Largest outer contour = ring outer boundary
+    outer_i, outer_a = -1, 0
+    for i in range(len(cnts)):
+        if hier[i][3] == -1:
+            a = cv2.contourArea(cnts[i])
+            if a > outer_a:
+                outer_a, outer_i = a, i
+    if outer_i < 0:
+        return mask
+
+    # Largest child = inner hole boundary
+    inner_i, inner_a = -1, 0
+    ci = hier[outer_i][2]
+    while ci != -1:
+        a = cv2.contourArea(cnts[ci])
+        if a > inner_a:
+            inner_a, inner_i = a, ci
+        ci = hier[ci][0]
+
+    def _gauss(cnt):
+        pts = cnt.reshape(-1, 2).astype(np.float64)
+        n   = len(pts)
+        if n < 6:
+            return cnt
+        half_k = int(3 * sigma)
+        kx     = np.arange(-half_k, half_k + 1, dtype=np.float64)
+        kernel = np.exp(-kx ** 2 / (2 * sigma ** 2))
+        kernel /= kernel.sum()
+        # Tile × 3 for circular boundary, convolve, keep middle copy
+        tx = np.tile(pts[:, 0], 3)
+        ty = np.tile(pts[:, 1], 3)
+        sx = np.convolve(tx, kernel, mode='same')[n:2 * n]
+        sy = np.convolve(ty, kernel, mode='same')[n:2 * n]
+        return np.column_stack([sx, sy]).reshape(-1, 1, 2).astype(np.int32)
+
+    result = np.zeros_like(mask)
+    cv2.drawContours(result, [_gauss(cnts[outer_i])], -1, 255, -1)
+    if inner_i >= 0:
+        cv2.drawContours(result, [_gauss(cnts[inner_i])], -1, 0, -1)
+    else:
+        # No inner hole detected — derive it by erosion
+        k_tw  = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (TRACK_HALF_WIDTH * 2 + 1, TRACK_HALF_WIDTH * 2 + 1))
+        inner = cv2.erode(result, k_tw)
+        result = cv2.bitwise_and(result, cv2.bitwise_not(inner))
+
+    return result if result.any() else mask
+
+
+def auto_detect_track_mask(warped, car_pos=None, sign_boxes=None):
     """
     Automatically segment the track from a 600×600 warped top-down view.
 
     Approach:
       1. Mask car ArUco only before Otsu (preserves track through sign areas).
       2. Dual-polarity Otsu + morphological clean-up.
-      3. For the two sign ROIs (STOP, 55), replace the fat sticker blob with a
-         thin bridging line (_bridge_sign_roi).
+      3. Locate signs via YOLO (uses sign_boxes if provided, else runs YOLO here)
+         and replace each sign blob with a thin bridging line (_bridge_sign_roi).
     """
     img = warped.copy()
 
@@ -304,53 +454,144 @@ def auto_detect_track_mask(warped, car_pos=None):
         cv2.circle(img, (int(car_pos[0]), int(car_pos[1])), 40, (180, 180, 180), -1)
 
     # ── Downsample to 300×300 for speed ──────────────────────────────
-    small   = cv2.resize(img, (WARP_W // 2, WARP_H // 2), interpolation=cv2.INTER_AREA)
-    gray    = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+    small = cv2.resize(img, (WARP_W // 2, WARP_H // 2), interpolation=cv2.INTER_AREA)
 
-    def _segment(thresh_type):
-        _, m = cv2.threshold(blurred, 0, 255, thresh_type + cv2.THRESH_OTSU)
-        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_close)
-        k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k_open)
-        min_area = (WARP_W // 2) * (WARP_H // 2) * 0.01
-        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        out, kept = np.zeros_like(m), 0
-        for c in cnts:
-            if cv2.contourArea(c) >= min_area:
-                cv2.drawContours(out, [c], -1, 255, -1)
-                kept += 1
-        return out, kept
+    # Blank the 4 ArUco corner markers in the downsampled warped image.
+    # They are dark stickers → white in BINARY_INV → appear as track bumps.
+    # Detect them here (they are still visible in the warped view) and paint
+    # them medium-gray so they fall below the Otsu/adaptive dark threshold.
+    _mc, _, _ = detect_markers(small)
+    for _mid, (_cx, _cy, _) in _mc.items():
+        if _mid in CORNER_IDS:
+            cv2.circle(small, (_cx, _cy), 22, (180, 180, 180), -1)
 
-    mask_inv, kept_inv = _segment(cv2.THRESH_BINARY_INV)
-    mask_nor, kept_nor = _segment(cv2.THRESH_BINARY)
-    ratio_inv = mask_inv.sum() / 255 / mask_inv.size
-    ratio_nor = mask_nor.sum() / 255 / mask_nor.size
-    TRACK_MIN, TRACK_MAX = 0.05, 0.70
+    gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-    def in_range(r):
-        return TRACK_MIN <= r <= TRACK_MAX
+    # Method A: CLAHE + global Otsu BINARY_INV.
+    # CLAHE (4×4 tiles = 75×75 px at 300×300) reduces large-scale brightness
+    # variation before the global threshold.  Works well for left/top/bottom.
+    gray_clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
+    blurred_a   = cv2.GaussianBlur(gray_clahe, (7, 7), 0)
+    _, seg_otsu = cv2.threshold(blurred_a, 0, 255,
+                                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    if   in_range(ratio_inv) and not in_range(ratio_nor):
-        clean_small, kept = mask_inv, kept_inv
-    elif in_range(ratio_nor) and not in_range(ratio_inv):
-        clean_small, kept = mask_nor, kept_nor
-    elif in_range(ratio_inv) and in_range(ratio_nor):
-        clean_small, kept = (mask_inv, kept_inv) if \
-            abs(ratio_inv - 0.30) <= abs(ratio_nor - 0.30) else (mask_nor, kept_nor)
-    else:
-        return None
+    # Method B: adaptive threshold on raw gray (no CLAHE — let the local
+    # window do its own normalisation).  blockSize=51 gives 51×51 px windows;
+    # C=8 requires a pixel to be 8 grey levels darker than the local
+    # Gaussian-weighted mean.  This catches the right-side track that appears
+    # globally bright (glare) but is still locally darker than the white table.
+    blurred_b  = cv2.GaussianBlur(gray, (7, 7), 0)
+    seg_adapt  = cv2.adaptiveThreshold(blurred_b, 255,
+                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 51, 8)
 
-    # ── Upsample back to 600×600 ─────────────────────────────────────
-    clean = cv2.resize(clean_small, (WARP_W, WARP_H), interpolation=cv2.INTER_NEAREST)
+    # OR-combine: a pixel is track if flagged by either method.
+    seg_raw = cv2.bitwise_or(seg_otsu, seg_adapt)
 
-    # Replace sticker blobs in sign ROIs with thin bridging lines
-    for rx1, ry1, rx2, ry2 in [ROI_STOP, ROI_55]:
-        clean = _bridge_sign_roi(clean, rx1, ry1, rx2, ry2)
+    # Morphological clean-up.
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    seg_raw = cv2.morphologyEx(seg_raw, cv2.MORPH_CLOSE, k_close)
+    k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    seg_raw = cv2.morphologyEx(seg_raw, cv2.MORPH_OPEN,  k_open)
+
+    # Clear image border (15 px at 300×300 = 30 px at 600×600).
+    # The perspective warp fills out-of-bounds pixels with black; those
+    # fill-pixels appear white in BINARY_INV and merge with the track edge,
+    # causing the left/right "overflow" seen in the mask.
+    _h, _w = seg_raw.shape
+    _brd = 15
+    seg_raw[:_brd, :]  = 0
+    seg_raw[-_brd:, :] = 0
+    seg_raw[:, :_brd]  = 0
+    seg_raw[:, -_brd:] = 0
+
+    # Blank the four image corners (radius 45 px) — environment outside the
+    # table that leaks into the warp corners after the border is cleared.
+    _cr = 45
+    cv2.circle(seg_raw, (0,   0),   _cr, 0, -1)
+    cv2.circle(seg_raw, (_w,  0),   _cr, 0, -1)
+    cv2.circle(seg_raw, (0,   _h),  _cr, 0, -1)
+    cv2.circle(seg_raw, (_w,  _h),  _cr, 0, -1)
+
+    # Remove blobs disconnected from the main ring.
+    # • The ring (all 4 sides connected) = ~13 000 px at 300×300.
+    # • "COMSYS 306" text blob (adaptive detected) = ~2 000–3 000 px.
+    # Threshold at 3 000 px safely drops text without cutting ring sections.
+    n_lbl, lbl_map, stats, _ = cv2.connectedComponentsWithStats(seg_raw, connectivity=8)
+    seg_filt = np.zeros_like(seg_raw)
+    for lbl in range(1, n_lbl):
+        if stats[lbl, cv2.CC_STAT_AREA] >= 3000:
+            seg_filt[lbl_map == lbl] = 255
+    seg_raw = seg_filt
+
+    # Debug: save segmentation before skeleton
+    cv2.imwrite(str(ROOT / "debug_otsu.png"),
+                cv2.resize(seg_raw, (WARP_W, WARP_H), interpolation=cv2.INTER_NEAREST))
+
+    # ── Upsample ──────────────────────────────────────────────────────
+    clean = cv2.resize(seg_raw, (WARP_W, WARP_H), interpolation=cv2.INTER_NEAREST)
+
+    # ── Uniform-width skeleton: distance-transform ridge + fixed dilation ──
+    # Distance-transform ridge at 0.85 threshold (0.92 was too strict — missed
+    # thin/corner points and left gaps in the skeleton).
+    dist         = cv2.distanceTransform(clean, cv2.DIST_L2, 5)
+    dilated_dist = cv2.dilate(dist, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    ridge        = ((dist >= dilated_dist * 0.85) & (clean > 0)).astype(np.uint8) * 255
+
+    # Close tiny skeleton gaps (< 9 px) before expanding to full width.
+    ridge = cv2.morphologyEx(ridge, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+
+    # Save ridge for diagnosis
+    cv2.imwrite(str(ROOT / "debug_ridge.png"), ridge)
+
+    # Expand skeleton to uniform TRACK_HALF_WIDTH.
+    dk    = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (TRACK_HALF_WIDTH * 2 + 1, TRACK_HALF_WIDTH * 2 + 1)
+    )
+    clean = cv2.dilate(ridge, dk)
+
+    # Final moderate close (21×21) — seals breaks ≤ ~10 px without merging
+    # the track band across the ring interior.
+    clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+
+    # ── Gaussian contour smoothing — removes sign-sticker bumps ──────
+    # sigma=50
+    # of a sign-sticker bump (~80-100 px) so it is almost entirely removed.
+    # Rounded corners (~110 px arc) are slightly softened (radius grows by
+    # ~35 px) but remain smooth curves — on/off track detection is unaffected.
+    # The inner boundary is smoothed independently so the ring does not shift.
+    clean = _smooth_ring_contours(clean, sigma=70)
+
+    # ── Bridge sign ROIs using the caller-supplied YOLO boxes ────────
+    # sign_boxes come from the main thread's _sign_cache; we never call
+    # detect_signs() here because this function runs in a background thread
+    # and concurrent PyTorch inference from two threads causes a deadlock.
+    if sign_boxes is None:
+        sign_boxes = []
+
+    # Only STOP and 55 signs are physical stickers on the track surface.
+    # Light-indicator detections are beside the track — bridging them would
+    # cut false gaps in the ring.
+    STICKER_CLASSES = {'stop', 'speed_55'}
+    sticker_boxes = [b for b in sign_boxes
+                     if len(b) < 7 or b[6] in STICKER_CLASSES]
+
+    print(f"[Bridge] all_boxes={len(sign_boxes)} sticker_boxes={len(sticker_boxes)}")
+    for b in sign_boxes:
+        cls = b[6] if len(b) > 6 else '?'
+        print(f"  box cls={cls} xy=({b[0]},{b[1]},{b[2]},{b[3]})")
+
+    global _dynamic_sign_rois
+    _dynamic_sign_rois = [(b[0], b[1], b[2], b[3]) for b in sticker_boxes]
+
+    for b in sticker_boxes:
+        clean = _bridge_sign_roi(clean, b[0], b[1], b[2], b[3])
 
     cv2.imwrite(str(ROOT / "track_mask.png"), clean)
-    print(f"[Auto] Track mask detected ({kept} blob(s)) → track_mask.png")
+    print(f"[Auto] Track mask detected ({len(sticker_boxes)} sign(s) bridged) → track_mask.png")
     return clean
 
 
@@ -362,7 +603,8 @@ def is_on_track(saved_mask, wx, wy, check_r=20):
     global _track_history, _track_status
 
     # Sign ROIs are on the track by definition — short-circuit mask check
-    for rx1, ry1, rx2, ry2 in [ROI_LIGHT, ROI_STOP, ROI_55]:
+    rois = _dynamic_sign_rois if _dynamic_sign_rois else [ROI_LIGHT, ROI_STOP, ROI_55]
+    for rx1, ry1, rx2, ry2 in rois:
         if rx1 <= wx <= rx2 and ry1 <= wy <= ry2:
             return True
 
@@ -401,13 +643,7 @@ def detect_signs(warped):
     """
     model = _get_sign_model()
 
-    CLASS_ROI = {
-        'light_off':   ROI_LIGHT,
-        'light_green': ROI_LIGHT,
-        'light_red':   ROI_LIGHT,
-        'stop':        ROI_STOP,
-        'speed_55':    ROI_55,
-    }
+    KNOWN_CLASSES = {'light_off', 'light_green', 'light_red', 'stop', 'speed_55'}
     BOX_COLOR = {
         'stop':        (0,   50, 255),
         'speed_55':    (255, 80,   0),
@@ -423,20 +659,32 @@ def detect_signs(warped):
         'light_red':   'RED',
     }
 
-    # Run YOLO on full warped image — same context as training data
+    # Run YOLO at 1280px — upscales 600×600 internally so small signs on
+    # the large table get enough pixels. Boxes are returned in 600×600 space.
+    # No spatial ROI filter: sign positions differ between the two tables,
+    # so the custom model's confidence threshold is the only gate.
+    # Reject any detection whose bounding box touches the image border —
+    # these are always artifacts of the perspective warp fill region.
+    BORDER = 10
+
     best = {}      # class_name -> (conf, xyxy)
-    for r in model(warped, verbose=False, conf=SIGN_CONF):
+    for r in model(warped, verbose=False, conf=SIGN_CONF, imgsz=1280):
         for box, c, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
             name = model.names[int(c)]
+            if name not in KNOWN_CLASSES:
+                continue
+            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+            if x1 < BORDER or y1 < BORDER or x2 > WARP_W - BORDER or y2 > WARP_H - BORDER:
+                continue  # border artifact
             conf_f = float(conf)
-            if conf_f <= best.get(name, (0.0, None))[0]:
-                continue
-            roi = CLASS_ROI.get(name)
-            if roi is None:
-                continue
-            bx = float((box[0] + box[2]) / 2)
-            by = float((box[1] + box[3]) / 2)
-            if roi[0] <= bx <= roi[2] and roi[1] <= by <= roi[3]:
+            bx = float(x1 + x2) / 2
+            by = float(y1 + y2) / 2
+            # The 55 sign on the large table looks like a STOP to the model.
+            # Use position to override: bottom half of image → speed_55.
+            if name == 'stop' and by > WARP_H * 0.55:
+                name = 'speed_55'
+            print(f"[YOLO] {name} conf={conf_f:.2f} center=({bx:.0f},{by:.0f}) box=({x1},{y1},{x2},{y2})")
+            if conf_f > best.get(name, (0.0, None))[0]:
                 best[name] = (conf_f, box)
 
     light_cls = max(
@@ -453,7 +701,7 @@ def detect_signs(warped):
         x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
         label = f"{BOX_LABEL[name]} {conf_f:.2f}"
         color = BOX_COLOR[name]
-        boxes.append((x1, y1, x2, y2, label, color))
+        boxes.append((x1, y1, x2, y2, label, color, name))  # name used for bridge filtering
 
     return {
         'light': light,
@@ -540,7 +788,7 @@ def draw_warped(frame, markers, M, saved_mask=None):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     # Draw YOLO bounding boxes on detected signs
-    for x1, y1, x2, y2, label, color in signs['boxes']:
+    for x1, y1, x2, y2, label, color, *_ in signs['boxes']:
         cv2.rectangle(warped, (x1, y1), (x2, y2), color, 2)
         cv2.putText(warped, label, (x1 + 3, y1 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 4)
@@ -584,6 +832,10 @@ def main():
         print("  python aruco_detect.py --source 0")
         return
 
+    # On macOS, cap.release() for GoPro blocks indefinitely.
+    # Install a SIGINT handler so Ctrl+C always exits immediately.
+    signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+
     cap = open_camera(args.source)
     if cap is None:
         print(f"无法打开摄像头 {args.source}")
@@ -608,10 +860,10 @@ def main():
     _first_detect_done = False
     _read_failures = 0
     _MAX_FAILURES = 300
-    def _run_mask_detection(warped_snap, car_pos_snap, M_snap):
+    def _run_mask_detection(warped_snap, car_pos_snap, M_snap, sign_boxes_snap):
         """Run in a background thread — stores result in _mask_result[0]."""
         global _mask_running, _mask_M
-        result = auto_detect_track_mask(warped_snap, car_pos_snap)
+        result = auto_detect_track_mask(warped_snap, car_pos_snap, sign_boxes_snap)
         _mask_result[0] = result
         if result is not None:
             _mask_M = M_snap   # remember which perspective this mask was built for
@@ -630,8 +882,10 @@ def main():
             cx, cy, _ = markers_now[CAR_ID]
             car_pos = warp_point((cx, cy), M)
         _mask_running = True
+        # Snapshot current YOLO boxes; if none cached yet, mask thread runs YOLO itself
+        current_boxes = list(_sign_cache['boxes'])
         threading.Thread(target=_run_mask_detection,
-                         args=(warped_now.copy(), car_pos, M.copy()), daemon=True).start()
+                         args=(warped_now.copy(), car_pos, M.copy(), current_boxes), daemon=True).start()
 
     print("使用步骤: 按'w'进入俯视图 → 轨道自动识别（后台运行，不影响画面）")
     print("'c'键可随时重新识别轨道  |  'r'显示ROI框  |  'm'显示掩膜")
@@ -733,7 +987,8 @@ def main():
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
-            break
+            cv2.destroyAllWindows()
+            os._exit(0)   # cap.release() hangs on macOS+GoPro; exit immediately
         elif key == ord('w'):
             show_warp = not show_warp
         elif key == ord('d'):
