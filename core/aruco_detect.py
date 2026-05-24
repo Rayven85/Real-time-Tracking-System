@@ -64,8 +64,8 @@ ROI_STOP  = (305, 472, 402, 550)   # Bottom: STOP sign
 ROI_55    = (468, 283, 568, 362)   # Right: speed limit 55 sign
 
 # ── YOLO sign detection ──────────────────────────────────────────────
-SIGN_MODEL_PATH  = str(ROOT / "runs/train/track_signs/weights/best.pt")
-SIGN_CONF        = 0.05
+SIGN_MODEL_PATH  = str(ROOT / "runs/detect/runs/train/track_signs/weights/best.pt")
+SIGN_CONF        = 0.10
 SIGN_EVERY_N     = 8     # run YOLO once every N frames; reuse result in between
 _sign_model      = None
 _sign_cache      = {'light': 'OFF', 'stop': False, 'speed': False, 'boxes': []}
@@ -579,11 +579,6 @@ def auto_detect_track_mask(warped, car_pos=None, sign_boxes=None):
     sticker_boxes = [b for b in sign_boxes
                      if len(b) < 7 or b[6] in STICKER_CLASSES]
 
-    print(f"[Bridge] all_boxes={len(sign_boxes)} sticker_boxes={len(sticker_boxes)}")
-    for b in sign_boxes:
-        cls = b[6] if len(b) > 6 else '?'
-        print(f"  box cls={cls} xy=({b[0]},{b[1]},{b[2]},{b[3]})")
-
     global _dynamic_sign_rois
     _dynamic_sign_rois = [(b[0], b[1], b[2], b[3]) for b in sticker_boxes]
 
@@ -677,13 +672,11 @@ def detect_signs(warped):
             if x1 < BORDER or y1 < BORDER or x2 > WARP_W - BORDER or y2 > WARP_H - BORDER:
                 continue  # border artifact
             conf_f = float(conf)
-            bx = float(x1 + x2) / 2
+            # Positional fallback: 55 sign on large table is misclassified as stop.
+            # Bottom half of image → reclassify as speed_55.
             by = float(y1 + y2) / 2
-            # The 55 sign on the large table looks like a STOP to the model.
-            # Use position to override: bottom half of image → speed_55.
             if name == 'stop' and by > WARP_H * 0.55:
                 name = 'speed_55'
-            print(f"[YOLO] {name} conf={conf_f:.2f} center=({bx:.0f},{by:.0f}) box=({x1},{y1},{x2},{y2})")
             if conf_f > best.get(name, (0.0, None))[0]:
                 best[name] = (conf_f, box)
 
