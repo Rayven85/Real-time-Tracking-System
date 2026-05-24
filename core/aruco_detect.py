@@ -64,7 +64,7 @@ ROI_STOP  = (305, 472, 402, 550)   # Bottom: STOP sign
 ROI_55    = (468, 283, 568, 362)   # Right: speed limit 55 sign
 
 # ── YOLO sign detection ──────────────────────────────────────────────
-SIGN_MODEL_PATH  = str(ROOT / "runs/detect/runs/train/track_signs/weights/best.pt")
+SIGN_MODEL_PATH  = str(ROOT / "runs/train/track_signs/weights/best.pt")
 SIGN_CONF        = 0.05
 SIGN_EVERY_N     = 8     # run YOLO once every N frames; reuse result in between
 _sign_model      = None

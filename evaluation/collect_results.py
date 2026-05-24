@@ -5,7 +5,7 @@ import csv
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE = ROOT / "runs/detect/runs/train"
+BASE = ROOT / "runs/train"
 
 MODELS = {
     "yolov5nu":  BASE / "yolov5nu",

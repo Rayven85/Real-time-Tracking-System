@@ -15,7 +15,7 @@ from pathlib import Path
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parent.parent
-WEIGHTS = str(ROOT / "runs/detect/runs/train/yolov11n/weights/best.pt")
+WEIGHTS = str(ROOT / "runs/train/yolov11n/weights/best.pt")
 
 CLASS_COLORS = [
     (0, 0, 255),    # danger      → 红

@@ -16,7 +16,7 @@ from pathlib import Path
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL_PATH = str(ROOT / "runs/detect/runs/train/track_signs/weights/best.pt")
+MODEL_PATH = str(ROOT / "runs/train/track_signs/weights/best.pt")
 
 ROI_LIGHT = (10,  252, 72,  315)
 ROI_STOP  = (305, 472, 402, 550)

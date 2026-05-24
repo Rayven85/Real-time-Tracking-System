@@ -24,11 +24,11 @@ ROOT = Path(__file__).resolve().parent.parent
 CLASS_NAMES = ['danger', 'mandatory', 'other', 'prohibitory']
 
 MODELS = {
-    "yolov5nu": str(ROOT / "runs/detect/runs/train/yolov5nu/weights/best.pt"),
-    "yolov8n":  str(ROOT / "runs/detect/runs/train/yolov8n/weights/best.pt"),
-    "yolov9t":  str(ROOT / "runs/detect/runs/train/yolov9t/weights/best.pt"),
-    "yolov10n": str(ROOT / "runs/detect/runs/train/yolov10n/weights/best.pt"),
-    "yolov11n": str(ROOT / "runs/detect/runs/train/yolov11n/weights/best.pt"),
+    "yolov5nu": str(ROOT / "runs/train/yolov5nu/weights/best.pt"),
+    "yolov8n":  str(ROOT / "runs/train/yolov8n/weights/best.pt"),
+    "yolov9t":  str(ROOT / "runs/train/yolov9t/weights/best.pt"),
+    "yolov10n": str(ROOT / "runs/train/yolov10n/weights/best.pt"),
+    "yolov11n": str(ROOT / "runs/train/yolov11n/weights/best.pt"),
 }
 
 # 对比图中每个模型的颜色（BGR）
