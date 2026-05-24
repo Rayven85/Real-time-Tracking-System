@@ -53,7 +53,7 @@ def train_model(name: str, weights: str, args: dict) -> dict:
     print(f"{'='*60}")
 
     model   = YOLO(weights)
-    results = model.train(project=str(ROOT / "runs/train"), name=name, **args)
+    results = model.train(project=str(ROOT / "runs/train"), name=name, resume=args.get("resume",False), **{k:v for k,v in args.items() if k !="resume"})
 
     metrics = results.results_dict if hasattr(results, "results_dict") else {}
     return {
@@ -91,6 +91,7 @@ def main():
     parser.add_argument("--device",       default="0", help="'0' for GPU, 'cpu' for CPU")
     parser.add_argument("--skip-trained", action="store_true",
                         help="Skip models whose best.pt already exists")
+    parser.add_argument("--resume", action="store_true", help="Resume training from last.pt checkpoint")
     opt = parser.parse_args()
 
     device = auto_device(opt.device)
