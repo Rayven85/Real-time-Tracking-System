@@ -65,7 +65,7 @@ ROI_55    = (468, 283, 568, 362)   # Right: speed limit 55 sign
 
 # ── YOLO sign detection ──────────────────────────────────────────────
 SIGN_MODEL_PATH  = str(ROOT / "runs/train/track_signs/weights/best.pt")
-SIGN_CONF        = 0.10
+SIGN_CONF        = 0.5
 SIGN_EVERY_N     = 8     # run YOLO once every N frames; reuse result in between
 _sign_model      = None
 _sign_cache      = {'light': 'OFF', 'stop': False, 'speed': False, 'boxes': []}
