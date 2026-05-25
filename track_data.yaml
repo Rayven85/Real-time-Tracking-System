@@ -1,6 +1,5 @@
-path: /Users/zhaoxiaorong/Desktop/study/Real-time tracking system/TrackingSystem/track_dataset
+path: D:/Rong/Real-time-Tracking-System/track_dataset
 train: images/train
-val:   images/val
-
+val: images/val
 nc: 5
 names: ['stop', 'speed_55', 'light_off', 'light_green', 'light_red']
