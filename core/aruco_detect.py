@@ -64,7 +64,7 @@ ROI_STOP  = (305, 472, 402, 550)   # Bottom: STOP sign
 ROI_55    = (468, 283, 568, 362)   # Right: speed limit 55 sign
 
 # ── YOLO sign detection ──────────────────────────────────────────────
-SIGN_MODEL_PATH  = str(ROOT / "runs/detect/runs/train/track_signs/weights/best.pt")
+SIGN_MODEL_PATH  = str(ROOT / "runs/train/track_signs/weights/best.pt")
 SIGN_CONF        = 0.10
 SIGN_EVERY_N     = 8     # run YOLO once every N frames; reuse result in between
 _sign_model      = None
@@ -662,23 +662,30 @@ def detect_signs(warped):
     # these are always artifacts of the perspective warp fill region.
     BORDER = 10
 
-    best = {}      # class_name -> (conf, xyxy)
-    for r in model(warped, verbose=False, conf=SIGN_CONF, imgsz=1280):
+    best = {}      # class_name -> (conf, (x1,y1,x2,y2))
+    _raw = []
+    for r in model(warped, verbose=False, conf=0.01, imgsz=1280):
         for box, c, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
             name = model.names[int(c)]
-            if name not in KNOWN_CLASSES:
-                continue
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-            if x1 < BORDER or y1 < BORDER or x2 > WARP_W - BORDER or y2 > WARP_H - BORDER:
-                continue  # border artifact
             conf_f = float(conf)
-            # Positional fallback: 55 sign on large table is misclassified as stop.
-            # Bottom half of image → reclassify as speed_55.
-            by = float(y1 + y2) / 2
-            if name == 'stop' and by > WARP_H * 0.55:
-                name = 'speed_55'
-            if conf_f > best.get(name, (0.0, None))[0]:
-                best[name] = (conf_f, box)
+            border_fail = (x1 < BORDER or y1 < BORDER or x2 > WARP_W - BORDER or y2 > WARP_H - BORDER)
+            _raw.append((name, conf_f, x1, y1, x2, y2, border_fail))
+    print(f"[YOLO RAW] {len(_raw)} detections (conf>=0.01):")
+    for name, conf_f, x1, y1, x2, y2, border_fail in _raw:
+        flag = "BORDER" if border_fail else ("PASS" if conf_f >= SIGN_CONF else f"low<{SIGN_CONF}")
+        print(f"  {name:12s} conf={conf_f:.3f}  ({x1},{y1},{x2},{y2})  {flag}")
+    if not _raw:
+        print("  (nothing — model output is empty)")
+
+    for name, conf_f, x1, y1, x2, y2, border_fail in _raw:
+        if name not in KNOWN_CLASSES or border_fail or conf_f < SIGN_CONF:
+            continue
+        by = float(y1 + y2) / 2
+        if name == 'stop' and by > WARP_H * 0.55:
+            name = 'speed_55'
+        if conf_f > best.get(name, (0.0, None))[0]:
+            best[name] = (conf_f, (x1, y1, x2, y2))
 
     light_cls = max(
         (n for n in ('light_off', 'light_green', 'light_red') if n in best),
@@ -691,7 +698,7 @@ def detect_signs(warped):
     # Build box list for drawing
     boxes = []
     for name, (conf_f, box) in best.items():
-        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        x1, y1, x2, y2 = box
         label = f"{BOX_LABEL[name]} {conf_f:.2f}"
         color = BOX_COLOR[name]
         boxes.append((x1, y1, x2, y2, label, color, name))  # name used for bridge filtering

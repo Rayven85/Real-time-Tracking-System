@@ -1,4 +1,4 @@
-path: D:\Rong\Real-time-Tracking-System\track_dataset
+path: /Users/zhaoxiaorong/Desktop/study/Real-time tracking system/TrackingSystem/track_dataset
 train: images/train
 val:   images/val
 
