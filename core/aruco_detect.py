@@ -65,7 +65,7 @@ ROI_55    = (468, 283, 568, 362)   # Right: speed limit 55 sign
 
 # ── YOLO sign detection ──────────────────────────────────────────────
 SIGN_MODEL_PATH  = str(ROOT / "runs/train/track_signs/weights/best.pt")
-SIGN_CONF        = 0.5
+SIGN_CONF        = 0.40
 SIGN_EVERY_N     = 8     # run YOLO once every N frames; reuse result in between
 _sign_model      = None
 _sign_cache      = {'light': 'OFF', 'stop': False, 'speed': False, 'boxes': []}
@@ -242,55 +242,6 @@ def _perspective_changed(M_new):
     max_shift = float(np.max(np.linalg.norm(p_new - p_old, axis=2)))
     return max_shift > MASK_REPRO_THR
 
-
-def _bridge_sign_roi(mask, rx1, ry1, rx2, ry2, line_width=10):
-    """
-    Replace the fat sticker blob inside a sign ROI with a thin bridging line.
-
-    Scans a strip outside each ROI edge to find where the track enters/exits,
-    clears the ROI interior, then connects the two most-separated entry/exit
-    points with a straight line (longest pair → avoids Y/T shapes).
-    """
-    h, w = mask.shape
-    pad  = 18
-    candidates = []
-
-    strip = mask[max(0, ry1 - pad):ry1, rx1:rx2]
-    if strip.any():
-        cols = np.where(strip.any(axis=0))[0]
-        candidates.append((int(cols.mean()) + rx1, ry1))
-
-    strip = mask[ry2:min(h, ry2 + pad), rx1:rx2]
-    if strip.any():
-        cols = np.where(strip.any(axis=0))[0]
-        candidates.append((int(cols.mean()) + rx1, ry2))
-
-    strip = mask[ry1:ry2, max(0, rx1 - pad):rx1]
-    if strip.any():
-        rows = np.where(strip.any(axis=1))[0]
-        candidates.append((rx1, int(rows.mean()) + ry1))
-
-    strip = mask[ry1:ry2, rx2:min(w, rx2 + pad)]
-    if strip.any():
-        rows = np.where(strip.any(axis=1))[0]
-        candidates.append((rx2, int(rows.mean()) + ry1))
-
-    mask[ry1:ry2, rx1:rx2] = 0
-
-    if len(candidates) < 2:
-        return mask
-
-    best_d, best_pair = -1, (candidates[0], candidates[1])
-    for i in range(len(candidates)):
-        for j in range(i + 1, len(candidates)):
-            dx = candidates[i][0] - candidates[j][0]
-            dy = candidates[i][1] - candidates[j][1]
-            d  = dx * dx + dy * dy
-            if d > best_d:
-                best_d, best_pair = d, (candidates[i], candidates[j])
-
-    cv2.line(mask, best_pair[0], best_pair[1], 255, line_width)
-    return mask
 
 
 def _extract_track_ring(mask):
@@ -531,18 +482,39 @@ def auto_detect_track_mask(warped, car_pos=None, sign_boxes=None):
     # ── Upsample ──────────────────────────────────────────────────────
     clean = cv2.resize(seg_raw, (WARP_W, WARP_H), interpolation=cv2.INTER_NEAREST)
 
+    # ── Identify sign sticker boxes early (needed for tape removal) ──
+    if sign_boxes is None:
+        sign_boxes = []
+    STICKER_CLASSES = {'stop', 'speed_55'}
+    sticker_boxes = [b for b in sign_boxes
+                     if len(b) < 7 or b[6] in STICKER_CLASSES]
+
+    # ── Erase sign + tape regions from binary mask ───────────────────
+    # The black tape holding each sign creates T/+ shaped blobs in the
+    # Otsu mask.  Blank a padded rectangle so tape disappears before the
+    # ridge is computed.  The gap is left empty — is_on_track() treats
+    # anything inside _dynamic_sign_rois as on-track, so the car is never
+    # flagged as off-track while crossing a sign area.
+    TAPE_PAD = 20
+    padded_rois = []
+    for b in sticker_boxes:
+        x1, y1, x2, y2 = b[0], b[1], b[2], b[3]
+        px1 = max(0, x1 - TAPE_PAD);  py1 = max(0, y1 - TAPE_PAD)
+        px2 = min(WARP_W, x2 + TAPE_PAD); py2 = min(WARP_H, y2 + TAPE_PAD)
+        cv2.rectangle(clean, (px1, py1), (px2, py2), 0, -1)
+        padded_rois.append((px1, py1, px2, py2))
+
+    cv2.imwrite(str(ROOT / "debug_otsu.png"), clean)
+
     # ── Uniform-width skeleton: distance-transform ridge + fixed dilation ──
-    # Distance-transform ridge at 0.85 threshold (0.92 was too strict — missed
-    # thin/corner points and left gaps in the skeleton).
     dist         = cv2.distanceTransform(clean, cv2.DIST_L2, 5)
     dilated_dist = cv2.dilate(dist, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
     ridge        = ((dist >= dilated_dist * 0.85) & (clean > 0)).astype(np.uint8) * 255
 
-    # Close tiny skeleton gaps (< 9 px) before expanding to full width.
+    # Close tiny gaps (< 9 px) in the skeleton before expanding.
     ridge = cv2.morphologyEx(ridge, cv2.MORPH_CLOSE,
                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
 
-    # Save ridge for diagnosis
     cv2.imwrite(str(ROOT / "debug_ridge.png"), ridge)
 
     # Expand skeleton to uniform TRACK_HALF_WIDTH.
@@ -552,38 +524,15 @@ def auto_detect_track_mask(warped, car_pos=None, sign_boxes=None):
     )
     clean = cv2.dilate(ridge, dk)
 
-    # Final moderate close (21×21) — seals breaks ≤ ~10 px without merging
-    # the track band across the ring interior.
+    # Seal remaining micro-gaps after dilation.
     clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE,
-                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
 
-    # ── Gaussian contour smoothing — removes sign-sticker bumps ──────
-    # sigma=50
-    # of a sign-sticker bump (~80-100 px) so it is almost entirely removed.
-    # Rounded corners (~110 px arc) are slightly softened (radius grows by
-    # ~35 px) but remain smooth curves — on/off track detection is unaffected.
-    # The inner boundary is smoothed independently so the ring does not shift.
-    clean = _smooth_ring_contours(clean, sigma=70)
-
-    # ── Bridge sign ROIs using the caller-supplied YOLO boxes ────────
-    # sign_boxes come from the main thread's _sign_cache; we never call
-    # detect_signs() here because this function runs in a background thread
-    # and concurrent PyTorch inference from two threads causes a deadlock.
-    if sign_boxes is None:
-        sign_boxes = []
-
-    # Only STOP and 55 signs are physical stickers on the track surface.
-    # Light-indicator detections are beside the track — bridging them would
-    # cut false gaps in the ring.
-    STICKER_CLASSES = {'stop', 'speed_55'}
-    sticker_boxes = [b for b in sign_boxes
-                     if len(b) < 7 or b[6] in STICKER_CLASSES]
-
+    # ── Register sign ROIs for on-track short-circuit ────────────────
+    # Use the original YOLO bounding box (no padding) — only the sign
+    # itself counts as on-track, not the surrounding tape area.
     global _dynamic_sign_rois
     _dynamic_sign_rois = [(b[0], b[1], b[2], b[3]) for b in sticker_boxes]
-
-    for b in sticker_boxes:
-        clean = _bridge_sign_roi(clean, b[0], b[1], b[2], b[3])
 
     cv2.imwrite(str(ROOT / "track_mask.png"), clean)
     print(f"[Auto] Track mask detected ({len(sticker_boxes)} sign(s) bridged) → track_mask.png")
@@ -671,13 +620,6 @@ def detect_signs(warped):
             conf_f = float(conf)
             border_fail = (x1 < BORDER or y1 < BORDER or x2 > WARP_W - BORDER or y2 > WARP_H - BORDER)
             _raw.append((name, conf_f, x1, y1, x2, y2, border_fail))
-    print(f"[YOLO RAW] {len(_raw)} detections (conf>=0.01):")
-    for name, conf_f, x1, y1, x2, y2, border_fail in _raw:
-        flag = "BORDER" if border_fail else ("PASS" if conf_f >= SIGN_CONF else f"low<{SIGN_CONF}")
-        print(f"  {name:12s} conf={conf_f:.3f}  ({x1},{y1},{x2},{y2})  {flag}")
-    if not _raw:
-        print("  (nothing — model output is empty)")
-
     for name, conf_f, x1, y1, x2, y2, border_fail in _raw:
         if name not in KNOWN_CLASSES or border_fail or conf_f < SIGN_CONF:
             continue
@@ -854,6 +796,7 @@ def main():
     shot_count = 0
     frame_count = 0
     t_start = time.perf_counter()
+    global _sign_cache, _sign_frame_cnt
     M = None
     saved_mask = None   # auto-detected track mask
     _M_stable_frames = 0
@@ -957,6 +900,8 @@ def main():
                 _first_detect_done = True
                 warped_now = cv2.warpPerspective(frame, M, (WARP_W, WARP_H))
                 saved_mask = None   # clear stale mask while new one computes
+                _sign_cache = detect_signs(warped_now)  # ensure fresh boxes before mask
+                _sign_frame_cnt = 0
                 _trigger_mask(warped_now, markers)
 
         # 决定显示内容
@@ -999,6 +944,8 @@ def main():
                 warped_now = cv2.warpPerspective(frame, M, (WARP_W, WARP_H))
                 _mask_result[0] = None
                 saved_mask = None
+                _sign_cache = detect_signs(warped_now)  # ensure fresh boxes before mask
+                _sign_frame_cnt = 0
                 _trigger_mask(warped_now, markers)
                 print("轨道识别中（后台）…")
             else:

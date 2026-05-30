@@ -30,21 +30,23 @@ The system is a single-process Python application running on Mac (development) a
    │  ArUco ID 4      │      │   every 8th frame     │
    │                  │      │   (frame-skip cache)  │
    │  query mask at   │      │   full 600×600 image  │
-   │  car position    │      │   → ROI centre filter │
+   │  car position    │      │   imgsz=1280 inference │
    └────────┬─────────┘      │   → STOP / 55 / LIGHT │
             │                └───────────────────────┘
    ON / OFF TRACK
    8-frame debounce
-   ROI short-circuit
+   Sign ROI short-circuit
+   (_dynamic_sign_rois)
             │
             └──────────────────────────────────────┐
                                                    │
                   ┌────────────────────────────────▼────┐
                   │  Background Daemon Thread            │
                   │  auto_detect_track_mask()            │
-                  │  • Dual-polarity Otsu threshold      │
-                  │  • Morphological close + open        │
-                  │  • _bridge_sign_roi() sticker fix    │
+                  │  • Dual-polarity Otsu + adaptive     │
+                  │  • Blank sign+tape areas (TAPE_PAD)  │
+                  │  • Distance-transform ridge skeleton │
+                  │  • Fixed-width dilation (TRACK_HALF) │
                   │  • Re-triggers on perspective shift  │
                   └──────────────────────────────────────┘
 ```
@@ -57,8 +59,8 @@ The system is a single-process Python application running on Mac (development) a
 | Marker detection | `cv2.aruco` DICT_4X4_50 | `core/aruco_detect.py` |
 | Perspective warp | `cv2.getPerspectiveTransform` | `core/aruco_detect.py` |
 | Vehicle localisation | ArUco ID 4 + track mask query | `core/aruco_detect.py` |
-| Sign detection | Custom YOLOv11n (5 classes) | `core/aruco_detect.py` |
-| Track mask (background) | Dual-polarity Otsu + morphology | `core/aruco_detect.py` |
+| Sign detection | Custom YOLOv11n (5 classes, imgsz=1280) | `core/aruco_detect.py` |
+| Track mask (background) | Dual-polarity Otsu + distance-transform ridge | `core/aruco_detect.py` |
 | Model training — multi-model | Ultralytics YOLO | `training/train.py` |
 | Model training — track signs | Ultralytics YOLO fine-tune | `training/train_track.py` |
 | Data labelling | HSV bootstrap + mouse editor | `training/auto_label.py` |
@@ -81,6 +83,8 @@ TrackingSystem/
 ├── data.yaml            YOLO config: GTSDB 4-class traffic sign dataset
 ├── track_data.yaml      YOLO config: custom 5-class track sign dataset
 ├── track_mask.png       Auto-saved track mask (written at runtime by aruco_detect.py)
+├── debug_otsu.png       Debug: binary segmentation before ridge (written at runtime)
+├── debug_ridge.png      Debug: distance-transform ridge skeleton (written at runtime)
 │
 ├── core/
 ├── training/
@@ -106,23 +110,23 @@ TrackingSystem/
 
 The entry point of the entire project. Contains two scripts.
 
-**`aruco_detect.py`** (768 lines) — The real-time pipeline. All major subsystems live here:
+**`aruco_detect.py`** — The real-time pipeline. All major subsystems live here:
 
-| Section | Lines | Responsibility |
-|---|---|---|
-| Constants & config | 1–75 | Camera params, ROI coordinates, model path, warp size |
-| Camera management | `open_camera()` | Retry loop, CAP_AVFOUNDATION, warm-up frames |
-| ArUco detection | `detect_markers()` | Find IDs 0–4, return corners and car position |
-| Perspective warp | `get_perspective_transform()`, `warp_point()` | Homography M, point projection |
-| Undistortion | `build_undistort_maps()` | Pre-compute remap tables (currently disabled) |
-| Track mask (auto) | `auto_detect_track_mask()` | Otsu + morphology + bridge repair |
-| Track mask (thread) | `_trigger_mask()`, `_run_mask_detection()` | Non-blocking daemon thread |
-| Perspective change | `_perspective_changed()` | 15 px corner-shift threshold |
-| On/off track | `is_on_track()` | Mask pixel query + ROI short-circuit |
-| Sign detection | `detect_signs()` | YOLO full-image + ROI centre filter |
-| Drawing — raw | `draw_raw()` | Overlay markers on original frame |
-| Drawing — warped | `draw_warped()` | HUD: car position, ON/OFF, sign boxes |
-| Main loop | `main()` | Camera → ArUco → warp → display → keyboard |
+| Section | Responsibility |
+|---|---|
+| Constants & config | Camera params, ROI coordinates, model path, warp size, `TRACK_HALF_WIDTH`, `SIGN_CONF` |
+| Camera management | `open_camera()` — retry loop, CAP_AVFOUNDATION, warm-up frames |
+| ArUco detection | `detect_markers()` — find IDs 0–4, return corners and car position |
+| Perspective warp | `get_perspective_transform()`, `warp_point()` — homography M, point projection |
+| Undistortion | `build_undistort_maps()` — pre-compute remap tables (currently disabled) |
+| Track mask (auto) | `auto_detect_track_mask()` — Otsu + adaptive + ridge skeleton + fixed dilation |
+| Track mask (thread) | `_trigger_mask()`, `_run_mask_detection()` — non-blocking daemon thread |
+| Perspective change | `_perspective_changed()` — 15 px corner-shift threshold |
+| On/off track | `is_on_track()` — mask pixel query + `_dynamic_sign_rois` short-circuit |
+| Sign detection | `detect_signs()` — YOLO full-image at imgsz=1280, border filter, positional reclassification |
+| Drawing — raw | `draw_raw()` — overlay markers on original frame |
+| Drawing — warped | `draw_warped()` — HUD: car position, ON/OFF, sign boxes |
+| Main loop | `main()` — camera → ArUco → warp → display → keyboard |
 
 **`generate_markers.py`** (52 lines) — Generates 5 printable ArUco PNGs into `markers/`:
 
@@ -146,13 +150,17 @@ Usage: python training/train.py --models yolov8n yolov11n --epochs 100
 
 Base weights are loaded from `weights/`. Trained weights are saved to `runs/train/<model>/weights/best.pt`.
 
-**`train_track.py`** (86 lines) — Fine-tunes `weights/yolo11n.pt` on the track-specific sign dataset (`track_dataset/`). Outputs to `runs/train/track_signs/`.
+**`train_track.py`** (96 lines) — Fine-tunes `weights/yolo11n.pt` on the track-specific sign dataset (`track_dataset/`). Outputs to `runs/train/track_signs/`.
 
 ```
 Usage: python training/train_track.py --epochs 50
+       python training/train_track.py --epochs 50 --device mps   # Apple Silicon
+       python training/train_track.py --resume                    # resume from last.pt
 ```
 
-Key parameters: 5 classes (stop / speed_55 / light_off / light_green / light_red), batch=8 (CPU-friendly), patience=15 (early stopping).
+Key parameters: 5 classes (stop / speed_55 / light_off / light_green / light_red), batch=8 (CPU-friendly), patience=15 (early stopping). Training uses the default `imgsz=640`; inference runs at `imgsz=1280` to upscale small signs at detection time.
+
+Supports `--device mps` for Apple Silicon GPU acceleration and `--resume` to continue from `runs/train/track_signs/weights/last.pt` without creating a new run directory.
 
 **`auto_label.py`** (307 lines) — Semi-automatic YOLO label generator for the 600×600 warped screenshots.
 
@@ -341,13 +349,12 @@ All output from training, evaluation, and inference scripts is written here. Nev
 
 ```
 runs/
-├── train/                         Output of training/train.py
+├── train/                         Output of training scripts
 │   ├── yolov5nu/weights/best.pt
 │   ├── yolov8n/weights/best.pt
 │   ├── yolov9t/weights/best.pt
 │   ├── yolov10n/weights/best.pt
-│   └── yolov11n/weights/best.pt
-├── detect/runs/train/             Output when YOLO saves to detect/ subdirectory
+│   ├── yolov11n/weights/best.pt
 │   └── track_signs/weights/best.pt    ← loaded by aruco_detect.py
 ├── evaluation/
 │   └── test_results.csv           Output of evaluation/evaluate.py
@@ -434,7 +441,6 @@ The oblique camera angle produces a trapezoidal view. Once the four corner marke
 
 **Solution:** Before placing the car, press `c` to trigger `auto_detect_track_mask()` on the clean (car-free) warped view. The result is saved to `track_mask.png`. All subsequent queries check this pre-saved mask, not the live image.
 
-
 **Debounce:** 8-frame rolling window, >60% majority required to update ON/OFF state. Prevents flickering when the car drives near the track edge.
 
 ---
@@ -461,56 +467,80 @@ Dataset: 44 training + 12 validation images (600×600 px warped screenshots). 5 
 | 3 | `light_green` | Green light on |
 | 4 | `light_red` | Red light on |
 
-Training results: mAP50 = **0.995**, mAP50-95 = 0.873, Precision ~0.97, Recall ~0.96.
-
 **Integration bug — cropped ROI vs full image:**
 
 First attempt sent each ROI crop individually to YOLO. The model was trained on full 600×600 frames — in a crop, the sign fills the entire input. Distribution mismatch → zero detections even at conf=0.05. Diagnosed with `training/debug_yolo.py`.
 
-**Fix:** Send the **complete 600×600 warped image** to YOLO, then filter detections by ROI centre position:
+**Fix:** Send the **complete 600×600 warped image** to YOLO. No spatial ROI filter is applied — the model's confidence threshold is the only gate. This also allows the system to generalise across different table setups where sign positions may vary.
 
-```python
-for box, c, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
-    bx = float((box[0] + box[2]) / 2)
-    by = float((box[1] + box[3]) / 2)
-    if roi[0] <= bx <= roi[2] and roi[1] <= by <= roi[3]:
-        best[name] = (conf_f, box)
-```
+**imgsz=1280 inference:** The signs appear small relative to the 600×600 frame (~100×80 px). Running inference at `imgsz=1280` causes YOLO to internally upscale the image before the backbone, giving the network more pixels per sign. Returned bounding boxes are in the original 600×600 coordinate space. This increased real-detection confidence dramatically:
 
-Immediate result: `stop=0.907, light_off=0.825, speed_55=0.475`.
+| Sign | Confidence (old model, imgsz=640) | Confidence (current model, imgsz=1280) |
+|---|---|---|
+| stop | up to 0.30 | 0.96–0.98 |
+| speed_55 | up to 0.30 | 0.72–0.99 |
+| light_off | up to 0.30 | 0.63–0.76 |
+
+Noise/ghost detections remain consistently at 0.01–0.06, creating a clear gap. `SIGN_CONF = 0.40` safely sits in this gap.
+
+**Border filter:** Any detection whose bounding box touches within 10 px of the frame edge is discarded — these are always artefacts of the black fill region produced by `warpPerspective` outside the table boundary.
+
+**Positional reclassification:** The STOP sign and speed_55 sign look similar to the model. If a `stop` detection is centred in the bottom half of the frame (y > 55% of height), it is reclassified as `speed_55` — the bottom position is unambiguously the speed sign location in the physical layout.
 
 **Frame-skip caching:** YOLO CPU inference ≈ 100–300 ms/call. Running every frame → ~5 FPS. Solution: run every 8th frame, cache the result for intermediate frames → **~25 FPS**.
 
 ---
 
-### Week 9–11: Automatic Track Mask Detection
+### Week 9–13: Automatic Track Mask Detection
 
 Previously required manual `c` keypress. Supervisor required full automation with adaptive re-detection.
 
-**Pipeline:**
+**Segmentation pipeline:**
 
 ```
 raw frame → perspective warp (600×600) → downsample (300×300)
-→ Gaussian blur → Otsu dual-polarity threshold → morphological clean
-→ upsample (600×600) → _bridge_sign_roi() → save track_mask.png
+→ blank ArUco corner markers → CLAHE + Gaussian blur
+→ Otsu(Otsu's method) BINARY_INV  ─┐
+                     ├─ OR-combine → morphological close + open
+→ adaptive threshold ─┘
+→ connected-component filter (keep blobs ≥ 3000 px)
+→ clear border + corner regions → upsample (600×600)
+→ blank sign + tape areas (YOLO bbox + 20 px pad)
+→ distance-transform ridge skeleton
+→ MORPH_CLOSE (9×9) on ridge → dilate to TRACK_HALF_WIDTH=14
+→ final MORPH_CLOSE (15×15) → save track_mask.png
 ```
 
-**Dual-polarity Otsu:** Standard Otsu only tries one binary direction. Track polarity (dark-on-light vs light-on-dark) can vary across setups. Both directions are tried; the one with a white-pixel ratio closest to 30% (typical oval track) is selected. No manual threshold needed.
+**Dual-polarity Otsu + adaptive combine:** Standard Otsu only tries one binary direction. Track polarity (dark-on-light vs light-on-dark) can vary across setups. `BINARY_INV` Otsu handles the typical dark-on-light case; adaptive threshold (blockSize=51, C=8) catches track sections on the right side where glare makes them globally bright but still locally darker than the table surface. The two binary images are OR-combined.
 
-**Half-resolution processing:** Detection runs at 300×300 (75% fewer pixels), upscaled to 600×600. Reduces CPU time enough to run in a background daemon thread without blocking the main loop.
+**Half-resolution processing:** Segmentation runs at 300×300 (75% fewer pixels), upscaled to 600×600. Reduces CPU time enough to run in a background daemon thread without blocking the main loop.
 
-**`_bridge_sign_roi()` — sticker occlusion fix:**
+**Tape misdetection fix — blank sign areas before ridge:**
 
-Black adhesive stickers under the three road signs match the track colour. Otsu classifies them as track; morphological close expands them into thick rectangular blobs. Four approaches were tried:
+Black adhesive tape holding signs to the track creates T/+ shaped blobs in the Otsu binary mask. These blobs survive into the ridge and expand into thick rectangular protrusions during dilation, causing non-uniform track width at sign positions.
 
-| Version | Strategy | Outcome |
-|---|---|---|
-| v1 | Paint ROI as table colour before Otsu → fill → draw line | Right-side track deleted; Y/T artefacts |
-| v2 | Paint only car ArUco, not sign ROIs | Sticker blobs remain |
-| v3 | Scan 18 px ROI perimeter → find entry points → bridge with straight line | Stable — clean thin lines |
-| v4 | Skeletonisation + branch pruning | Complete failure — edge truncation erodes inward |
+Fix: After upsampling, blank a padded rectangle (YOLO bounding box + `TAPE_PAD=20` px on each side) for every `stop` and `speed_55` detection. The tape and sign area becomes zero in the binary mask before the ridge is computed. The gap is left empty — no bridging line is drawn.
 
-Current solution (v3): clear ROI interior, find the two most-distant track entry points on the ROI perimeter, connect with one straight line (avoids Y/T junctions).
+**Distance-transform ridge skeleton:**
+
+To achieve uniform track width regardless of the original track line's varying pixel thickness, the mask is reduced to a centerline (1–4 px wide ridge) then re-expanded to a fixed width.
+
+```python
+dist         = cv2.distanceTransform(clean, cv2.DIST_L2, 5)
+dilated_dist = cv2.dilate(dist, ellipse_kernel(9))
+ridge        = (dist >= dilated_dist * 0.85) & (clean > 0)   # local maxima
+ridge        = cv2.morphologyEx(ridge, MORPH_CLOSE, ellipse_kernel(9))
+clean        = cv2.dilate(ridge, ellipse_kernel(TRACK_HALF_WIDTH*2+1))
+clean        = cv2.morphologyEx(clean, MORPH_CLOSE, ellipse_kernel(15))
+```
+
+The ridge is the set of pixels where the distance-to-background equals the local maximum within a 9×9 neighbourhood — i.e., the skeleton centerline of the track band. Dilating by `TRACK_HALF_WIDTH=14` gives a uniform 28 px wide track band everywhere.
+
+**`_dynamic_sign_rois` — on-track short-circuit for sign areas:**
+
+Because the sign+tape area is blanked in the mask, the car will show as OFF TRACK when passing through a sign position. To prevent false off-track events, `auto_detect_track_mask()` stores the original YOLO bounding boxes (no padding) of all sign stickers in `_dynamic_sign_rois`. In `is_on_track()`, if the car's warped position falls inside any of these boxes, the function returns `True` immediately without consulting the mask — the sign position is on-track by construction.
+
+Only the sign's actual bounding box counts (not the padded tape area) — this means the car must be squarely on the sign to trigger the short-circuit, matching the physical reality that the track passes directly under each sign.
 
 **Non-blocking background thread:**
 
@@ -528,8 +558,6 @@ if _mask_result[0] is not None:
 
 **Perspective change re-detection:** The homography matrix `_mask_M` from the last detection is stored. Each frame, all four image corners are projected through both `_mask_M` and the current `M`. If any corner shifts more than **15 px**, re-detection is triggered.
 
-**ROI short-circuit in `is_on_track()`:** When the car is within a sign ROI zone (where stickers can cause mask gaps), the function returns `True` immediately without querying the mask — these zones are always on-track by construction.
-
 ---
 
 ## Key Technical Decisions
@@ -542,12 +570,17 @@ if _mask_result[0] is not None:
 | `DICT_4X4_50` | Simplest 16-bit pattern, easiest to detect at close overhead range | Larger dicts: slower, unnecessary for this use case |
 | Pre-capture track mask | Car ArUco marker physically covers track beneath it | Real-time pixel sampling: marker occludes track → always OFF TRACK |
 | Custom YOLO training | Real-world sign models cannot generalise to miniature A4-printed signs | Direct transfer: domain gap too large, zero detections |
-| Full-image inference + ROI filter | Model trained on full 600×600 frames — crops create distribution mismatch | Crop-then-detect: domain mismatch → zero detections |
+| Full-image inference + confidence gate | Model trained on full 600×600 frames; spatial ROI filter rejected in favour of model confidence | Crop-then-detect: domain mismatch; fixed ROI: sign positions differ between tables |
+| `imgsz=1280` at inference | Upscales 600×600 image internally; signs ~100×80 px get more backbone pixels | `imgsz=640`: real detections plateau at conf≤0.30, noisy separation from background |
+| `SIGN_CONF=0.40` | Clear gap between real detections (≥0.63) and noise (≤0.06); 0.40 sits safely in the middle | Lower threshold: ghost detections pass; higher threshold: may drop light_off (0.63) |
 | Frame-skip caching (every 8 frames) | CPU inference ~200 ms; skipping recovers ~25 FPS | Per-frame inference: ~5 FPS, unusable |
-| Dual-polarity Otsu | Track polarity unknown across setups; one direction would fail for some | Single-polarity: requires manual threshold tuning per setup |
+| Blank sign+tape area before ridge | Tape creates T/+ blobs in Otsu that widen the ridge; blanking removes them before skeleton | Contour smoothing: Gaussian sigma=70 widened corners; sigma=10 created 4-pointed star artefacts |
+| Distance-transform ridge + fixed dilation | Ridge = local maxima of distance transform = uniform centerline; dilating by `TRACK_HALF_WIDTH` gives constant width everywhere | Original Otsu binary: variable width; morphological erosion: killed thin ridges |
+| Leave gap at sign positions | Tape area fully blanked; no bridging line needed | Bridge with straight line: required complex perimeter scan; any misdetection left permanent artefact |
+| `_dynamic_sign_rois` short-circuit | Gap in mask at sign positions would falsely report OFF TRACK; short-circuit returns ON TRACK if car is inside sign bbox | Fixed static ROIs: sign positions differ between the two physical tables |
+| Dual-polarity Otsu + adaptive OR | Track polarity and brightness varies across the table; neither method alone captures all sides | Single Otsu: misses glare-affected right side; adaptive alone: noisier on uniform sections |
 | Background daemon thread | Mask detection ~300 ms on CPU — synchronous call freezes video stream | Synchronous: ~3 FPS, unacceptable |
 | Disable distortion correction | Wide mode distortion negligible at overhead height; correction degraded image | Apply manual k1/k2: estimated values too aggressive at this mount height |
-| `_bridge_sign_roi` v3 | Skeletonisation (v4) failed due to edge erosion; simple bridging is robust | Skeletonisation + branch pruning: unstable when track has edge gaps |
 
 ---
 
@@ -573,6 +606,16 @@ if _mask_result[0] is not None:
 | Recall | ~0.96 |
 | Training set | 44 images |
 | Validation set | 12 images |
+| Inference imgsz | 1280 (upscaled at inference time) |
+| Confidence threshold | 0.40 |
+
+**Detection confidence with current model (imgsz=1280):**
+
+| Sign | Typical conf range | Noise floor |
+|---|---|---|
+| stop | 0.96–0.98 | < 0.06 |
+| speed_55 | 0.72–0.99 | < 0.06 |
+| light_off | 0.63–0.76 | < 0.06 |
 
 ### Runtime Performance
 
