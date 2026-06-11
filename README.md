@@ -2,7 +2,7 @@
 
 ## System Architecture
 
-The system is a single-process Python application running on Mac (development) and targeting Nvidia Jetson Orin (deployment). All computation happens locally — no network required. The main loop in `core/aruco_detect.py` drives everything; a daemon thread handles the slow track-mask computation without blocking the video stream.
+The system is a single-process Python application running on Mac (development) and targeting Nvidia Jetson Orin (deployment). All computation happens locally — no network required. The main loop in `core/aruco_detect.py` drives everything; two daemon threads handle heavy computation: one for YOLO sign detection, one for track-mask computation.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -28,7 +28,7 @@ The system is a single-process Python application running on Mac (development) a
    ┌──────────────────┐      ┌───────────────────────┐
    │  Vehicle Track   │      │   YOLO Sign Detect    │
    │  ArUco ID 4      │      │   every 8th frame     │
-   │                  │      │   (frame-skip cache)  │
+   │                  │      │   (background thread) │
    │  query mask at   │      │   full 600×600 image  │
    │  car position    │      │   imgsz=1280 inference │
    └────────┬─────────┘      │   → STOP / 55 / LIGHT │
@@ -38,11 +38,19 @@ The system is a single-process Python application running on Mac (development) a
    Sign ROI short-circuit
    (_dynamic_sign_rois)
             │
+   ┌────────┴─────────┐
+   │ Distance Measure │
+   │ press p → A→B    │
+   │ press k → calib  │
+   │ (ArUco corners)  │
+   └──────────────────┘
+            │
             └──────────────────────────────────────┐
                                                    │
                   ┌────────────────────────────────▼────┐
                   │  Background Daemon Thread            │
                   │  auto_detect_track_mask()            │
+                  │  • YOLO (fresh) → sign positions     │
                   │  • Dual-polarity Otsu + adaptive     │
                   │  • Blank sign+tape areas (TAPE_PAD)  │
                   │  • Distance-transform ridge skeleton │
@@ -60,6 +68,8 @@ The system is a single-process Python application running on Mac (development) a
 | Perspective warp | `cv2.getPerspectiveTransform` | `core/aruco_detect.py` |
 | Vehicle localisation | ArUco ID 4 + track mask query | `core/aruco_detect.py` |
 | Sign detection | Custom YOLOv11n (5 classes, imgsz=1280) | `core/aruco_detect.py` |
+| Sign detection (thread) | daemon thread, single-element list handoff | `core/aruco_detect.py` |
+| Distance measurement | ArUco-corner calibration + mouse click A→B | `core/aruco_detect.py` |
 | Track mask (background) | Dual-polarity Otsu + distance-transform ridge | `core/aruco_detect.py` |
 | Model training — multi-model | Ultralytics YOLO | `training/train.py` |
 | Model training — track signs | Ultralytics YOLO fine-tune | `training/train_track.py` |
@@ -85,6 +95,7 @@ TrackingSystem/
 ├── track_mask.png       Auto-saved track mask (written at runtime by aruco_detect.py)
 ├── debug_otsu.png       Debug: binary segmentation before ridge (written at runtime)
 ├── debug_ridge.png      Debug: distance-transform ridge skeleton (written at runtime)
+├── distance_calib.json  Scale calibration: cm/px for x and y axes (written at runtime)
 │
 ├── core/
 ├── training/
@@ -124,6 +135,8 @@ The entry point of the entire project. Contains two scripts.
 | Perspective change | `_perspective_changed()` — 15 px corner-shift threshold |
 | On/off track | `is_on_track()` — mask pixel query + `_dynamic_sign_rois` short-circuit |
 | Sign detection | `detect_signs()` — YOLO full-image at imgsz=1280, border filter, positional reclassification |
+| Sign detection (thread) | `_trigger_sign_detection()`, `_sign_running`, `_sign_result` — non-blocking YOLO daemon |
+| Distance measurement | `_on_mouse()`, `_draw_dist_overlay()`, `_load/save_dist_calib()` — click A→B, display real-world distance |
 | Drawing — raw | `draw_raw()` — overlay markers on original frame |
 | Drawing — warped | `draw_warped()` — HUD: car position, ON/OFF, sign boxes |
 | Main loop | `main()` — camera → ArUco → warp → display → keyboard |
@@ -487,7 +500,7 @@ Noise/ghost detections remain consistently at 0.01–0.06, creating a clear gap.
 
 **Positional reclassification:** The STOP sign and speed_55 sign look similar to the model. If a `stop` detection is centred in the bottom half of the frame (y > 55% of height), it is reclassified as `speed_55` — the bottom position is unambiguously the speed sign location in the physical layout.
 
-**Frame-skip caching:** YOLO CPU inference ≈ 100–300 ms/call. Running every frame → ~5 FPS. Solution: run every 8th frame, cache the result for intermediate frames → **~25 FPS**.
+**YOLO background thread:** YOLO CPU inference ≈ 100–300 ms/call. Running every frame → ~5 FPS. The original solution was to run every 8th frame and cache the result, but this still caused a periodic stutter on the 8th-frame blocking call. YOLO now runs in a background daemon thread (`_trigger_sign_detection()`), firing every 8th frame trigger but executing asynchronously. The main loop reads `_sign_result[0]` without blocking, eliminating the periodic frame stutter entirely → **~25 FPS**.
 
 ---
 
@@ -542,9 +555,15 @@ Because the sign+tape area is blanked in the mask, the car will show as OFF TRAC
 
 Only the sign's actual bounding box counts (not the padded tape area) — this means the car must be squarely on the sign to trigger the short-circuit, matching the physical reality that the track passes directly under each sign.
 
-**Non-blocking background thread:**
+**Non-blocking background threads:**
 
-`auto_detect_track_mask()` takes ~200–400 ms on CPU. Daemon thread + single-element shared list pattern:
+There are now two background daemon threads:
+
+1. **YOLO sign detection thread** — `_trigger_sign_detection()` fires a daemon thread on every 8th frame trigger. The thread writes its result to `_sign_result[0]`; the main loop reads and clears this without blocking. `_sign_running` prevents duplicate concurrent threads.
+
+2. **Track mask thread** — `auto_detect_track_mask()` takes ~200–400 ms on CPU. When mask re-detection is triggered (e.g. by a perspective shift), YOLO runs first *synchronously inside the mask thread* to obtain fresh sign positions, then the mask segmentation runs with those results. This guarantees that sign+tape areas are blanked correctly using up-to-date bounding boxes.
+
+Both threads use the daemon thread + single-element shared list pattern:
 
 ```python
 _mask_running = False
@@ -573,13 +592,14 @@ if _mask_result[0] is not None:
 | Full-image inference + confidence gate | Model trained on full 600×600 frames; spatial ROI filter rejected in favour of model confidence | Crop-then-detect: domain mismatch; fixed ROI: sign positions differ between tables |
 | `imgsz=1280` at inference | Upscales 600×600 image internally; signs ~100×80 px get more backbone pixels | `imgsz=640`: real detections plateau at conf≤0.30, noisy separation from background |
 | `SIGN_CONF=0.40` | Clear gap between real detections (≥0.63) and noise (≤0.06); 0.40 sits safely in the middle | Lower threshold: ghost detections pass; higher threshold: may drop light_off (0.63) |
-| Frame-skip caching (every 8 frames) | CPU inference ~200 ms; skipping recovers ~25 FPS | Per-frame inference: ~5 FPS, unusable |
+| Frame-skip caching → background thread (every 8 frames trigger) | CPU inference ~200 ms; moved to background thread to eliminate periodic frame stutter; YOLO runs inside mask thread on re-detection to guarantee fresh sign positions for tape blanking | Per-frame inference: ~5 FPS, unusable; synchronous every-8th-frame: recovers FPS but still causes periodic stutter |
 | Blank sign+tape area before ridge | Tape creates T/+ blobs in Otsu that widen the ridge; blanking removes them before skeleton | Contour smoothing: Gaussian sigma=70 widened corners; sigma=10 created 4-pointed star artefacts |
 | Distance-transform ridge + fixed dilation | Ridge = local maxima of distance transform = uniform centerline; dilating by `TRACK_HALF_WIDTH` gives constant width everywhere | Original Otsu binary: variable width; morphological erosion: killed thin ridges |
 | Leave gap at sign positions | Tape area fully blanked; no bridging line needed | Bridge with straight line: required complex perimeter scan; any misdetection left permanent artefact |
 | `_dynamic_sign_rois` short-circuit | Gap in mask at sign positions would falsely report OFF TRACK; short-circuit returns ON TRACK if car is inside sign bbox | Fixed static ROIs: sign positions differ between the two physical tables |
 | Dual-polarity Otsu + adaptive OR | Track polarity and brightness varies across the table; neither method alone captures all sides | Single Otsu: misses glare-affected right side; adaptive alone: noisier on uniform sections |
 | Background daemon thread | Mask detection ~300 ms on CPU — synchronous call freezes video stream | Synchronous: ~3 FPS, unacceptable |
+| ArUco corners as calibration reference | Corner markers are mapped to exact pixel positions (0,0)→(600,0)→(600,600)→(0,600) by the perspective transform; scale_x = real_width/600, scale_y = real_height/600 — no manual point-clicking needed | Click-to-calibrate: underdetermined for non-square tables (one measurement → two unknowns) |
 | Disable distortion correction | Wide mode distortion negligible at overhead height; correction degraded image | Apply manual k1/k2: estimated values too aggressive at this mount height |
 
 ---
@@ -621,7 +641,7 @@ if _mask_result[0] is not None:
 
 | Component | FPS / Latency |
 |---|---|
-| YOLO sign detection — per frame (no cache) | ~5 FPS |
-| YOLO sign detection — every 8th frame (cached) | **~25 FPS** |
+| YOLO sign detection (background thread, every 8th frame trigger) | ~200 ms per run, non-blocking |
+| Main loop FPS (YOLO fully offloaded) | **~25 FPS, no periodic stutter** |
 | Track mask detection (background thread) | ~200–400 ms, non-blocking |
 | Perspective change detection | per-frame, negligible cost |

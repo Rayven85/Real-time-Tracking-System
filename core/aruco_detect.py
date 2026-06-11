@@ -53,15 +53,8 @@ _track_status = False  # 当前稳定状态
 
 # ── STOP compliance ──────────────────────────────────────────────────
 STOP_SPEED_THRESHOLD = 5.0  # px/s — below this counts as stopped
-STOP_ZONE_PAD = 20          # px padding around ROI_STOP for detection
 STOP_DISPLAY_SEC = 2.0      # how long to show STOP event message
 _stop_event = {'text': '', 'color': (0, 0, 0), 'until': 0.0}
-
-# ── Sign detection ROIs in warped 600×600 view ──────────────────────
-# Format: (x1, y1, x2, y2)  — press 'r' to visualize, tune as needed
-ROI_LIGHT = (10,  252, 72,  315)   # Left: circular LED indicator
-ROI_STOP  = (305, 472, 402, 550)   # Bottom: STOP sign
-ROI_55    = (468, 283, 568, 362)   # Right: speed limit 55 sign
 
 # ── YOLO sign detection ──────────────────────────────────────────────
 SIGN_MODEL_PATH  = str(ROOT / "runs/train/track_signs/weights/best.pt")
@@ -70,11 +63,39 @@ SIGN_EVERY_N     = 8     # run YOLO once every N frames; reuse result in between
 _sign_model      = None
 _sign_cache      = {'light': 'OFF', 'stop': False, 'speed': False, 'boxes': []}
 _sign_frame_cnt  = 0
+_sign_running    = False   # True while background YOLO thread is running
+_sign_result     = [None]  # [0] holds the latest result from the background thread
 _mask_running    = False   # True while background thread is computing track mask
 _mask_result     = [None]  # [0] holds the latest mask from the background thread
 _mask_M          = None    # M matrix used when last mask was computed
 MASK_REPRO_THR   = 15.0   # pixels — re-detect if any corner moves more than this
 _dynamic_sign_rois = []    # (x1,y1,x2,y2) boxes in warped 600×600 space; set by mask thread
+
+# ── Distance measurement ──────────────────────────────────────────────
+_dist_mode    = False      # True while user is clicking measurement points
+_dist_pt_a    = None       # first click in warped 600×600 space
+_dist_pt_b    = None       # second click
+_dist_scale_x = None       # cm per pixel along x-axis
+_dist_scale_y = None       # cm per pixel along y-axis
+
+_calib_state  = 'IDLE'     # IDLE | W_ENTER | H_ENTER
+_calib_buf    = ''         # digit string typed during W_ENTER / H_ENTER
+
+DIST_CALIB_FILE = str(ROOT / 'distance_calib.json')
+
+
+def _trigger_sign_detection(warped_snap):
+    """Fire YOLO in a daemon thread; skip if a run is already in progress."""
+    global _sign_running
+    if _sign_running:
+        return
+    _sign_running = True
+    def _run():
+        global _sign_running
+        result = detect_signs(warped_snap)
+        _sign_result[0] = result
+        _sign_running = False
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _get_sign_model():
@@ -547,8 +568,7 @@ def is_on_track(saved_mask, wx, wy, check_r=20):
     global _track_history, _track_status
 
     # Sign ROIs are on the track by definition — short-circuit mask check
-    rois = _dynamic_sign_rois if _dynamic_sign_rois else [ROI_LIGHT, ROI_STOP, ROI_55]
-    for rx1, ry1, rx2, ry2 in rois:
+    for rx1, ry1, rx2, ry2 in _dynamic_sign_rois:
         if rx1 <= wx <= rx2 and ry1 <= wy <= ry2:
             return True
 
@@ -623,9 +643,6 @@ def detect_signs(warped):
     for name, conf_f, x1, y1, x2, y2, border_fail in _raw:
         if name not in KNOWN_CLASSES or border_fail or conf_f < SIGN_CONF:
             continue
-        by = float(y1 + y2) / 2
-        if name == 'stop' and by > WARP_H * 0.55:
-            name = 'speed_55'
         if conf_f > best.get(name, (0.0, None))[0]:
             best[name] = (conf_f, (x1, y1, x2, y2))
 
@@ -706,11 +723,14 @@ def draw_warped(frame, markers, M, saved_mask=None):
     cv2.putText(warped, mask_text, (10, WARP_H - 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, mask_color, 1)
 
-    # Sign detection: run YOLO every SIGN_EVERY_N frames, reuse cache otherwise
+    # Sign detection: background thread fires every SIGN_EVERY_N frames
     global _sign_cache, _sign_frame_cnt
+    if _sign_result[0] is not None:
+        _sign_cache = _sign_result[0]
+        _sign_result[0] = None
     _sign_frame_cnt += 1
     if _sign_frame_cnt % SIGN_EVERY_N == 0:
-        _sign_cache = detect_signs(warped)
+        _trigger_sign_detection(warped.copy())
 
     signs = _sign_cache
     light_color = {'GREEN': (0, 220, 0), 'RED': (0, 0, 255), 'OFF': (120, 120, 120)}
@@ -737,17 +757,14 @@ def draw_warped(frame, markers, M, saved_mask=None):
         cv2.putText(warped, label, (x1 + 3, y1 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
 
-    # Debug: draw ROI rectangles, press 'r' to toggle
+    # Debug: draw dynamic sign ROIs detected by YOLO, press 'r' to toggle
     if draw_warped._show_rois:
-        for roi, label, col in [
-            (ROI_LIGHT, 'LIGHT', (0, 255, 255)),
-            (ROI_STOP,  'STOP',  (0, 80,  255)),
-            (ROI_55,    '55',    (255, 80, 0)),
-        ]:
-            x1, y1, x2, y2 = roi
-            cv2.rectangle(warped, (x1, y1), (x2, y2), col, 2)
-            cv2.putText(warped, label, (x1 + 3, y1 + 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+        for rx1, ry1, rx2, ry2 in _dynamic_sign_rois:
+            cv2.rectangle(warped, (rx1, ry1), (rx2, ry2), (0, 255, 255), 2)
+            cv2.putText(warped, 'SIGN ROI', (rx1 + 3, ry1 + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+    warped = _draw_dist_overlay(warped)
 
     # 调试：左=俯视图，右=轨道掩膜，按 'm' 切换
     if draw_warped._show_mask and saved_mask is not None:
@@ -758,6 +775,140 @@ def draw_warped(frame, markers, M, saved_mask=None):
 
 draw_warped._show_mask = False
 draw_warped._show_rois = False
+
+
+# ── Distance measurement helpers ──────────────────────────────────────
+
+def _load_dist_calib():
+    global _dist_scale_x, _dist_scale_y
+    import json
+    if not os.path.exists(DIST_CALIB_FILE):
+        return
+    try:
+        d = json.load(open(DIST_CALIB_FILE))
+        _dist_scale_x = d.get('scale_x')
+        _dist_scale_y = d.get('scale_y')
+        if _dist_scale_x and _dist_scale_y:
+            print(f"[Dist] 比例尺已加载: x={_dist_scale_x:.4f}, y={_dist_scale_y:.4f} cm/px")
+    except Exception:
+        pass
+
+
+def _save_dist_calib():
+    import json
+    with open(DIST_CALIB_FILE, 'w') as f:
+        json.dump({'scale_x': _dist_scale_x, 'scale_y': _dist_scale_y}, f)
+    print(f"[Dist] 比例尺已保存 → {DIST_CALIB_FILE}")
+
+
+def _finish_calib_input():
+    global _calib_state, _calib_buf, _dist_scale_x, _dist_scale_y
+    try:
+        real_cm = float(_calib_buf)
+        assert real_cm > 0
+    except Exception:
+        print("[Dist] 无效数值，请重新输入")
+        _calib_buf = ''
+        return
+    _calib_buf = ''
+
+    if _calib_state == 'W_ENTER':
+        # Corner 0 → Corner 1 spans exactly WARP_W pixels in the warped view
+        _dist_scale_x = real_cm / WARP_W
+        print(f"[Dist] 宽度标定完成: {WARP_W}px → {real_cm:.1f}cm  (scale_x={_dist_scale_x:.4f})")
+        _calib_state = 'H_ENTER'
+        print("[Dist] 请输入桌子高度（角标0 到 角标3 的实际距离，cm）")
+
+    elif _calib_state == 'H_ENTER':
+        # Corner 0 → Corner 3 spans exactly WARP_H pixels in the warped view
+        _dist_scale_y = real_cm / WARP_H
+        print(f"[Dist] 高度标定完成: {WARP_H}px → {real_cm:.1f}cm  (scale_y={_dist_scale_y:.4f})")
+        _calib_state = 'IDLE'
+        _save_dist_calib()
+        print("[Dist] 标定完成！按 'p' 进入测距模式")
+
+
+def _on_mouse(event, x, y, flags, param):
+    global _dist_pt_a, _dist_pt_b
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    if x >= WARP_W or y >= WARP_H:
+        return
+    if _dist_mode and _calib_state == 'IDLE':
+        pt = (x, y)
+        if _dist_pt_a is None:
+            _dist_pt_a = pt
+        elif _dist_pt_b is None:
+            _dist_pt_b = pt
+        else:
+            _dist_pt_a = pt
+            _dist_pt_b = None
+
+
+def _draw_dist_overlay(img):
+    """Draw distance calibration / measurement UI onto the 600×600 warped image."""
+    if _calib_state == 'IDLE' and not _dist_mode:
+        return img
+
+    # ── Calibration prompt ────────────────────────────────────────────
+    if _calib_state != 'IDLE':
+        cy = WARP_H // 2
+        cv2.rectangle(img, (0, cy - 30), (WARP_W, cy + 50), (0, 0, 0), -1)
+
+        if _calib_state == 'W_ENTER':
+            # Highlight top edge: corner 0 (top-left) → corner 1 (top-right)
+            cv2.line(img, (0, 3), (WARP_W, 3), (255, 200, 0), 4)
+            cv2.circle(img, (0, 3), 8, (255, 200, 0), -1)
+            cv2.circle(img, (WARP_W - 1, 3), 8, (255, 200, 0), -1)
+            cv2.putText(img, '0', (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
+            cv2.putText(img, '1', (WARP_W - 18, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
+            msg = '[Calib 1/2] Corner0 → Corner1  |  Type WIDTH in cm, press Enter'
+        else:  # H_ENTER
+            # Highlight left edge: corner 0 (top-left) → corner 3 (bottom-left)
+            cv2.line(img, (3, 0), (3, WARP_H), (0, 200, 255), 4)
+            cv2.circle(img, (3, 0), 8, (0, 200, 255), -1)
+            cv2.circle(img, (3, WARP_H - 1), 8, (0, 200, 255), -1)
+            cv2.putText(img, '0', (10, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
+            cv2.putText(img, '3', (10, WARP_H - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
+            msg = '[Calib 2/2] Corner0 → Corner3  |  Type HEIGHT in cm, press Enter'
+
+        cv2.putText(img, msg, (10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        cv2.putText(img, f'  Input: {_calib_buf}_ cm', (10, cy + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+    # ── Measurement hint ──────────────────────────────────────────────
+    if _dist_mode and _calib_state == 'IDLE':
+        hint = ('[DIST] Click A' if _dist_pt_a is None else
+                '[DIST] Click B' if _dist_pt_b is None else
+                '[DIST] Click to reset')
+        cv2.putText(img, hint, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+        cv2.putText(img, hint, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+    # ── Measurement points and result ─────────────────────────────────
+    if _dist_pt_a is not None:
+        cv2.circle(img, _dist_pt_a, 7, (0, 0, 210), -1)
+        cv2.putText(img, 'A', (_dist_pt_a[0] + 9, _dist_pt_a[1] - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 210), 2)
+    if _dist_pt_b is not None:
+        cv2.circle(img, _dist_pt_b, 7, (0, 180, 0), -1)
+        cv2.putText(img, 'B', (_dist_pt_b[0] + 9, _dist_pt_b[1] - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 180, 0), 2)
+
+    if _dist_pt_a is not None and _dist_pt_b is not None:
+        cv2.line(img, _dist_pt_a, _dist_pt_b, (220, 220, 220), 1)
+        mx = (_dist_pt_a[0] + _dist_pt_b[0]) // 2
+        my = (_dist_pt_a[1] + _dist_pt_b[1]) // 2
+        if _dist_scale_x and _dist_scale_y:
+            dx_r = (_dist_pt_b[0] - _dist_pt_a[0]) * _dist_scale_x
+            dy_r = (_dist_pt_b[1] - _dist_pt_a[1]) * _dist_scale_y
+            d_cm = float(np.sqrt(dx_r ** 2 + dy_r ** 2))
+            label = f'{d_cm / 100:.2f} m' if d_cm >= 100 else f'{d_cm:.1f} cm'
+        else:
+            label = 'calibrate first (k)'
+        cv2.putText(img, label, (mx + 4, my - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
+        cv2.putText(img, label, (mx + 4, my - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    return img
 
 
 def main():
@@ -786,7 +937,8 @@ def main():
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"使用摄像头: {w}x{h}")
-    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  't'=清轨迹  'd'=畸变对比  's'=截图  'q'=退出")
+    _load_dist_calib()
+    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  'd'=畸变对比  's'=截图  'k'=标定比例  'p'=测距  'q'=退出")
 
     # 预计算畸变矫正映射表
     map1, map2, roi = build_undistort_maps(h, w)
@@ -797,19 +949,25 @@ def main():
     frame_count = 0
     t_start = time.perf_counter()
     global _sign_cache, _sign_frame_cnt
+    global _dist_mode, _dist_pt_a, _dist_pt_b, _calib_state, _calib_buf
     M = None
     saved_mask = None   # auto-detected track mask
     _M_stable_frames = 0
     _first_detect_done = False
     _read_failures = 0
     _MAX_FAILURES = 300
-    def _run_mask_detection(warped_snap, car_pos_snap, M_snap, sign_boxes_snap):
-        """Run in a background thread — stores result in _mask_result[0]."""
-        global _mask_running, _mask_M
-        result = auto_detect_track_mask(warped_snap, car_pos_snap, sign_boxes_snap)
+    def _run_mask_detection(warped_snap, car_pos_snap, M_snap):
+        """Run YOLO then mask in one background thread — guarantees fresh sign positions."""
+        global _mask_running, _mask_M, _sign_running
+        # Step 1: fresh YOLO — gives accurate sign positions for tape blanking
+        fresh = detect_signs(warped_snap)
+        _sign_result[0] = fresh   # let main loop pick up updated sign state
+        _sign_running = False
+        # Step 2: mask with guaranteed-fresh boxes
+        result = auto_detect_track_mask(warped_snap, car_pos_snap, fresh['boxes'])
         _mask_result[0] = result
         if result is not None:
-            _mask_M = M_snap   # remember which perspective this mask was built for
+            _mask_M = M_snap
             print("✓ 轨道掩膜已更新")
         else:
             print("[Auto] 轨道识别失败，请检查光照或按 'c' 重试")
@@ -817,7 +975,7 @@ def main():
 
     def _trigger_mask(warped_now, markers_now):
         """Snapshot current frame and kick off background detection (non-blocking)."""
-        global _mask_running
+        global _mask_running, _sign_running
         if _mask_running:
             return
         car_pos = None
@@ -825,13 +983,16 @@ def main():
             cx, cy, _ = markers_now[CAR_ID]
             car_pos = warp_point((cx, cy), M)
         _mask_running = True
-        # Snapshot current YOLO boxes; if none cached yet, mask thread runs YOLO itself
-        current_boxes = list(_sign_cache['boxes'])
+        _sign_running = True   # block concurrent YOLO until mask thread finishes its own
         threading.Thread(target=_run_mask_detection,
-                         args=(warped_now.copy(), car_pos, M.copy(), current_boxes), daemon=True).start()
+                         args=(warped_now.copy(), car_pos, M.copy()), daemon=True).start()
 
     print("使用步骤: 按'w'进入俯视图 → 轨道自动识别（后台运行，不影响画面）")
     print("'c'键可随时重新识别轨道  |  'r'显示ROI框  |  'm'显示掩膜")
+    print("测距: 先按 'k' 标定两个轴，再按 'p' 进入测距模式，鼠标点 A / B 两点")
+
+    cv2.namedWindow("ArUco Detection")
+    cv2.setMouseCallback("ArUco Detection", _on_mouse)
 
     while True:
         ret, frame = cap.read()
@@ -900,8 +1061,6 @@ def main():
                 _first_detect_done = True
                 warped_now = cv2.warpPerspective(frame, M, (WARP_W, WARP_H))
                 saved_mask = None   # clear stale mask while new one computes
-                _sign_cache = detect_signs(warped_now)  # ensure fresh boxes before mask
-                _sign_frame_cnt = 0
                 _trigger_mask(warped_now, markers)
 
         # 决定显示内容
@@ -931,11 +1090,27 @@ def main():
         cv2.imshow("ArUco Detection", display)
 
         key = cv2.waitKey(1) & 0xFF
+
+        # Digit entry during calibration — intercept number keys before regular handlers
+        if _calib_state in ('W_ENTER', 'H_ENTER') and key != 255:
+            if ord('0') <= key <= ord('9'):
+                _calib_buf += chr(key)
+            elif key == ord('.') and '.' not in _calib_buf:
+                _calib_buf += '.'
+            elif key in (8, 127):   # backspace
+                _calib_buf = _calib_buf[:-1]
+            elif key == 13:         # Enter
+                _finish_calib_input()
+
         if key == ord('q'):
             cv2.destroyAllWindows()
             os._exit(0)   # cap.release() hangs on macOS+GoPro; exit immediately
         elif key == ord('w'):
             show_warp = not show_warp
+            if not show_warp:       # leaving warp view — cancel any active dist mode
+                _dist_mode = False
+                _dist_pt_a = None
+                _dist_pt_b = None
         elif key == ord('d'):
             show_distort_compare = True
         elif key == ord('c'):
@@ -944,8 +1119,6 @@ def main():
                 warped_now = cv2.warpPerspective(frame, M, (WARP_W, WARP_H))
                 _mask_result[0] = None
                 saved_mask = None
-                _sign_cache = detect_signs(warped_now)  # ensure fresh boxes before mask
-                _sign_frame_cnt = 0
                 _trigger_mask(warped_now, markers)
                 print("轨道识别中（后台）…")
             else:
@@ -959,6 +1132,25 @@ def main():
             fname = os.path.join(SCREENSHOT_DIR, f"aruco_{shot_count:03d}.jpg")
             cv2.imwrite(fname, display)
             print(f"截图保存: {fname}")
+        elif key == ord('k'):
+            if _calib_state != 'IDLE':
+                _calib_state = 'IDLE'
+                _calib_buf = ''
+                print("[Dist] 标定已取消")
+            elif show_warp and M is not None:
+                _calib_state = 'W_ENTER'
+                _calib_buf = ''
+                _dist_mode = False
+                print("[Dist] 标定开始 → 输入桌子宽度（角标0 到 角标1 的实际距离，cm）")
+            else:
+                print("[Dist] 请先按 'w' 进入俯视图")
+        elif key == ord('p'):
+            if _calib_state == 'IDLE' and show_warp and M is not None:
+                _dist_mode = not _dist_mode
+                if not _dist_mode:
+                    _dist_pt_a = None
+                    _dist_pt_b = None
+                print(f"[Dist] 测距模式 {'已开启 — 点击 A、B 两点' if _dist_mode else '已关闭'}")
 
     cap.release()
     cv2.destroyAllWindows()
