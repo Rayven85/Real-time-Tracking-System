@@ -34,11 +34,29 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 # ArUco 字典（与生成时一致）
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 ARUCO_PARAMS = cv2.aruco.DetectorParameters()
+# Subpixel refinement gives more accurate corner positions, reducing per-frame jitter
+ARUCO_PARAMS.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+# Larger adaptive threshold window helps in uneven / patchy lighting
+ARUCO_PARAMS.adaptiveThreshWinSizeMax = 53
+# More tolerant of perspective-distorted marker shapes (oblique camera angle)
+ARUCO_PARAMS.polygonalApproxAccuracyRate = 0.08
 DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
 
 # ID 定义
 CORNER_IDS = {0: '左上', 1: '右上', 2: '右下', 3: '左下'}
 CAR_ID = 4
+
+# ── Corner stabilisation ──────────────────────────────────────────────
+# EMA weight for each new detection (lower = smoother but slower to follow real movement)
+CORNER_SMOOTH_ALPHA   = 0.15
+# Frames to coast on last known position when a corner marker drops out
+# 30 frames ≈ 1 s at 30 fps — handles brief occlusion without M going None
+CORNER_PERSIST_FRAMES = 30
+_smooth_corners: dict = {}   # {id: {'cx': float, 'cy': float, 'pts': ndarray, 'lost': int}}
+
+# Scale EMA: very slow (α=0.05) so the "Table: X x Y cm" text is rock-stable.
+# The old code loaded a constant from JSON; now we compute per-frame but smooth heavily.
+SCALE_SMOOTH_ALPHA = 0.05
 
 # 矫正后输出画面大小
 WARP_W, WARP_H = 600, 600
@@ -72,16 +90,15 @@ MASK_REPRO_THR   = 15.0   # pixels — re-detect if any corner moves more than t
 _dynamic_sign_rois = []    # (x1,y1,x2,y2) boxes in warped 600×600 space; set by mask thread
 
 # ── Distance measurement ──────────────────────────────────────────────
+# The only hard-coded physical fact: each ArUco marker is a 10.5 cm square.
+# All other distances are inferred automatically from this single constant.
+ARUCO_REAL_SIZE_CM = 10.5
+
 _dist_mode    = False      # True while user is clicking measurement points
 _dist_pt_a    = None       # first click in warped 600×600 space
 _dist_pt_b    = None       # second click
-_dist_scale_x = None       # cm per pixel along x-axis
-_dist_scale_y = None       # cm per pixel along y-axis
-
-_calib_state  = 'IDLE'     # IDLE | W_ENTER | H_ENTER
-_calib_buf    = ''         # digit string typed during W_ENTER / H_ENTER
-
-DIST_CALIB_FILE = str(ROOT / 'distance_calib.json')
+_dist_scale_x = None       # cm per pixel along x-axis (auto-derived)
+_dist_scale_y = None       # cm per pixel along y-axis (auto-derived)
 
 
 def _trigger_sign_detection(warped_snap):
@@ -183,6 +200,53 @@ def detect_markers(frame):
     return result, corners, ids
 
 
+def _stabilise_corners(raw_markers):
+    """
+    Apply EMA smoothing and short-term persistence to the 4 corner markers.
+
+    Two sources of flicker are addressed:
+      • Jitter: detected position jumps ±a few pixels each frame → EMA damps this.
+      • Drop-out: marker not found for 1-CORNER_PERSIST_FRAMES frames → coast on
+        last known smoothed position so M doesn't go None and cause a view switch.
+
+    Non-corner markers (e.g. car ID 4) are passed through unchanged.
+    """
+    global _smooth_corners
+    result = dict(raw_markers)
+    for mid in CORNER_IDS:
+        if mid in raw_markers:
+            cx, cy, pts = raw_markers[mid]
+            if mid in _smooth_corners:
+                s = _smooth_corners[mid]
+                s['cx']  = CORNER_SMOOTH_ALPHA * cx  + (1 - CORNER_SMOOTH_ALPHA) * s['cx']
+                s['cy']  = CORNER_SMOOTH_ALPHA * cy  + (1 - CORNER_SMOOTH_ALPHA) * s['cy']
+                s['pts'] = CORNER_SMOOTH_ALPHA * pts + (1 - CORNER_SMOOTH_ALPHA) * s['pts']
+                s['lost'] = 0
+            else:
+                _smooth_corners[mid] = {
+                    'cx': float(cx), 'cy': float(cy),
+                    'pts': pts.astype(np.float32), 'lost': 0,
+                }
+            s = _smooth_corners[mid]
+            result[mid] = (
+                int(round(s['cx'])),
+                int(round(s['cy'])),
+                s['pts'].astype(np.float32),
+            )
+        elif mid in _smooth_corners:
+            s = _smooth_corners[mid]
+            s['lost'] += 1
+            if s['lost'] <= CORNER_PERSIST_FRAMES:
+                result[mid] = (
+                    int(round(s['cx'])),
+                    int(round(s['cy'])),
+                    s['pts'].astype(np.float32),
+                )
+            else:
+                del _smooth_corners[mid]
+    return result
+
+
 def get_perspective_transform(markers):
     """
     用4个桌角标记计算透视变换矩阵。
@@ -215,6 +279,33 @@ def warp_point(pt, M):
     p = np.float32([[pt]]).reshape(-1, 1, 2)
     warped = cv2.perspectiveTransform(p, M)
     return int(warped[0][0][0]), int(warped[0][0][1])
+
+
+def compute_scale_from_aruco(markers, M):
+    """
+    Auto-derive cm-per-pixel scale using only the known ArUco marker size.
+
+    Each corner marker (IDs 0-3) is ARUCO_REAL_SIZE_CM on every side.
+    Project its 4 detected corners through M into the warped 600×600 space.
+    The resulting pixel extents in x and y give cm/px independently for both
+    axes — no manual input, works for any table size or camera height.
+    """
+    x_scales, y_scales = [], []
+    for mid in CORNER_IDS:
+        if mid not in markers:
+            continue
+        _, _, pts = markers[mid]          # pts: (4, 2) corners in original image
+        wp = cv2.perspectiveTransform(
+            pts.reshape(-1, 1, 2).astype(np.float32), M).reshape(-1, 2)
+        x_ext = float(wp[:, 0].max() - wp[:, 0].min())
+        y_ext = float(wp[:, 1].max() - wp[:, 1].min())
+        if x_ext > 1:
+            x_scales.append(ARUCO_REAL_SIZE_CM / x_ext)
+        if y_ext > 1:
+            y_scales.append(ARUCO_REAL_SIZE_CM / y_ext)
+    if not x_scales or not y_scales:
+        return None, None
+    return float(np.mean(x_scales)), float(np.mean(y_scales))
 
 
 def draw_raw(frame, markers, ids, corners):
@@ -710,6 +801,13 @@ def draw_warped(frame, markers, M, saved_mask=None):
     cv2.rectangle(warped, (0, 0), (WARP_W - 1, WARP_H - 1), (0, 255, 255), 2)
     cv2.putText(warped, "Top-Down View", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    # Show inferred table size — derived purely from the 10.5 cm ArUco markers
+    if _dist_scale_x and _dist_scale_y:
+        tw = WARP_W * _dist_scale_x
+        th = WARP_H * _dist_scale_y
+        size_text = f"Table: {tw:.0f} x {th:.0f} cm"
+        cv2.putText(warped, size_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+        cv2.putText(warped, size_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
     # Track mask status indicator (bottom-left)
     if saved_mask is not None:
@@ -779,54 +877,6 @@ draw_warped._show_rois = False
 
 # ── Distance measurement helpers ──────────────────────────────────────
 
-def _load_dist_calib():
-    global _dist_scale_x, _dist_scale_y
-    import json
-    if not os.path.exists(DIST_CALIB_FILE):
-        return
-    try:
-        d = json.load(open(DIST_CALIB_FILE))
-        _dist_scale_x = d.get('scale_x')
-        _dist_scale_y = d.get('scale_y')
-        if _dist_scale_x and _dist_scale_y:
-            print(f"[Dist] 比例尺已加载: x={_dist_scale_x:.4f}, y={_dist_scale_y:.4f} cm/px")
-    except Exception:
-        pass
-
-
-def _save_dist_calib():
-    import json
-    with open(DIST_CALIB_FILE, 'w') as f:
-        json.dump({'scale_x': _dist_scale_x, 'scale_y': _dist_scale_y}, f)
-    print(f"[Dist] 比例尺已保存 → {DIST_CALIB_FILE}")
-
-
-def _finish_calib_input():
-    global _calib_state, _calib_buf, _dist_scale_x, _dist_scale_y
-    try:
-        real_cm = float(_calib_buf)
-        assert real_cm > 0
-    except Exception:
-        print("[Dist] 无效数值，请重新输入")
-        _calib_buf = ''
-        return
-    _calib_buf = ''
-
-    if _calib_state == 'W_ENTER':
-        # Corner 0 → Corner 1 spans exactly WARP_W pixels in the warped view
-        _dist_scale_x = real_cm / WARP_W
-        print(f"[Dist] 宽度标定完成: {WARP_W}px → {real_cm:.1f}cm  (scale_x={_dist_scale_x:.4f})")
-        _calib_state = 'H_ENTER'
-        print("[Dist] 请输入桌子高度（角标0 到 角标3 的实际距离，cm）")
-
-    elif _calib_state == 'H_ENTER':
-        # Corner 0 → Corner 3 spans exactly WARP_H pixels in the warped view
-        _dist_scale_y = real_cm / WARP_H
-        print(f"[Dist] 高度标定完成: {WARP_H}px → {real_cm:.1f}cm  (scale_y={_dist_scale_y:.4f})")
-        _calib_state = 'IDLE'
-        _save_dist_calib()
-        print("[Dist] 标定完成！按 'p' 进入测距模式")
-
 
 def _on_mouse(event, x, y, flags, param):
     global _dist_pt_a, _dist_pt_b
@@ -834,7 +884,7 @@ def _on_mouse(event, x, y, flags, param):
         return
     if x >= WARP_W or y >= WARP_H:
         return
-    if _dist_mode and _calib_state == 'IDLE':
+    if _dist_mode:
         pt = (x, y)
         if _dist_pt_a is None:
             _dist_pt_a = pt
@@ -846,43 +896,16 @@ def _on_mouse(event, x, y, flags, param):
 
 
 def _draw_dist_overlay(img):
-    """Draw distance calibration / measurement UI onto the 600×600 warped image."""
-    if _calib_state == 'IDLE' and not _dist_mode:
+    """Draw distance measurement UI onto the 600×600 warped image."""
+    if not _dist_mode:
         return img
 
-    # ── Calibration prompt ────────────────────────────────────────────
-    if _calib_state != 'IDLE':
-        cy = WARP_H // 2
-        cv2.rectangle(img, (0, cy - 30), (WARP_W, cy + 50), (0, 0, 0), -1)
-
-        if _calib_state == 'W_ENTER':
-            # Highlight top edge: corner 0 (top-left) → corner 1 (top-right)
-            cv2.line(img, (0, 3), (WARP_W, 3), (255, 200, 0), 4)
-            cv2.circle(img, (0, 3), 8, (255, 200, 0), -1)
-            cv2.circle(img, (WARP_W - 1, 3), 8, (255, 200, 0), -1)
-            cv2.putText(img, '0', (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
-            cv2.putText(img, '1', (WARP_W - 18, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
-            msg = '[Calib 1/2] Corner0 → Corner1  |  Type WIDTH in cm, press Enter'
-        else:  # H_ENTER
-            # Highlight left edge: corner 0 (top-left) → corner 3 (bottom-left)
-            cv2.line(img, (3, 0), (3, WARP_H), (0, 200, 255), 4)
-            cv2.circle(img, (3, 0), 8, (0, 200, 255), -1)
-            cv2.circle(img, (3, WARP_H - 1), 8, (0, 200, 255), -1)
-            cv2.putText(img, '0', (10, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
-            cv2.putText(img, '3', (10, WARP_H - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
-            msg = '[Calib 2/2] Corner0 → Corner3  |  Type HEIGHT in cm, press Enter'
-
-        cv2.putText(img, msg, (10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-        cv2.putText(img, f'  Input: {_calib_buf}_ cm', (10, cy + 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-
     # ── Measurement hint ──────────────────────────────────────────────
-    if _dist_mode and _calib_state == 'IDLE':
-        hint = ('[DIST] Click A' if _dist_pt_a is None else
-                '[DIST] Click B' if _dist_pt_b is None else
-                '[DIST] Click to reset')
-        cv2.putText(img, hint, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-        cv2.putText(img, hint, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    hint = ('[DIST] Click A' if _dist_pt_a is None else
+            '[DIST] Click B' if _dist_pt_b is None else
+            '[DIST] Click to reset')
+    cv2.putText(img, hint, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+    cv2.putText(img, hint, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
     # ── Measurement points and result ─────────────────────────────────
     if _dist_pt_a is not None:
@@ -904,7 +927,7 @@ def _draw_dist_overlay(img):
             d_cm = float(np.sqrt(dx_r ** 2 + dy_r ** 2))
             label = f'{d_cm / 100:.2f} m' if d_cm >= 100 else f'{d_cm:.1f} cm'
         else:
-            label = 'calibrate first (k)'
+            label = 'scale not ready'
         cv2.putText(img, label, (mx + 4, my - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
         cv2.putText(img, label, (mx + 4, my - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
@@ -937,8 +960,7 @@ def main():
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"使用摄像头: {w}x{h}")
-    _load_dist_calib()
-    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  'd'=畸变对比  's'=截图  'k'=标定比例  'p'=测距  'q'=退出")
+    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  'd'=畸变对比  's'=截图  'k'=显示比例  'p'=测距  'q'=退出")
 
     # 预计算畸变矫正映射表
     map1, map2, roi = build_undistort_maps(h, w)
@@ -949,7 +971,7 @@ def main():
     frame_count = 0
     t_start = time.perf_counter()
     global _sign_cache, _sign_frame_cnt
-    global _dist_mode, _dist_pt_a, _dist_pt_b, _calib_state, _calib_buf
+    global _dist_mode, _dist_pt_a, _dist_pt_b, _dist_scale_x, _dist_scale_y
     M = None
     saved_mask = None   # auto-detected track mask
     _M_stable_frames = 0
@@ -989,7 +1011,7 @@ def main():
 
     print("使用步骤: 按'w'进入俯视图 → 轨道自动识别（后台运行，不影响画面）")
     print("'c'键可随时重新识别轨道  |  'r'显示ROI框  |  'm'显示掩膜")
-    print("测距: 先按 'k' 标定两个轴，再按 'p' 进入测距模式，鼠标点 A / B 两点")
+    print("测距: 按 'w' 进入俯视图，4个角标可见后比例尺自动推算，按 'p' 进入测距模式，鼠标点 A / B 两点")
 
     cv2.namedWindow("ArUco Detection")
     cv2.setMouseCallback("ArUco Detection", _on_mouse)
@@ -1037,14 +1059,22 @@ def main():
                 print(f"截图保存: {fname}")
             continue
 
-        # 用矫正后的图做 ArUco 检测
+        # 用矫正后的图做 ArUco 检测，并对角标做 EMA 平滑 + persistence
         markers, corners, ids = detect_markers(corrected)
+        markers = _stabilise_corners(markers)
         frame = corrected  # 后续显示都用矫正图
 
-        # 有4个角就更新透视矩阵
+        # 有4个角就更新透视矩阵，并从ArUco标记尺寸自动推算比例尺
         if all(i in markers for i in [0, 1, 2, 3]):
             M = get_perspective_transform(markers)
             _M_stable_frames += 1
+            sx, sy = compute_scale_from_aruco(markers, M)
+            if sx is not None:
+                if _dist_scale_x is None:
+                    _dist_scale_x, _dist_scale_y = sx, sy          # first frame: init directly
+                else:
+                    _dist_scale_x = SCALE_SMOOTH_ALPHA * sx + (1 - SCALE_SMOOTH_ALPHA) * _dist_scale_x
+                    _dist_scale_y = SCALE_SMOOTH_ALPHA * sy + (1 - SCALE_SMOOTH_ALPHA) * _dist_scale_y
         else:
             _M_stable_frames = 0
 
@@ -1091,17 +1121,6 @@ def main():
 
         key = cv2.waitKey(1) & 0xFF
 
-        # Digit entry during calibration — intercept number keys before regular handlers
-        if _calib_state in ('W_ENTER', 'H_ENTER') and key != 255:
-            if ord('0') <= key <= ord('9'):
-                _calib_buf += chr(key)
-            elif key == ord('.') and '.' not in _calib_buf:
-                _calib_buf += '.'
-            elif key in (8, 127):   # backspace
-                _calib_buf = _calib_buf[:-1]
-            elif key == 13:         # Enter
-                _finish_calib_input()
-
         if key == ord('q'):
             cv2.destroyAllWindows()
             os._exit(0)   # cap.release() hangs on macOS+GoPro; exit immediately
@@ -1133,19 +1152,15 @@ def main():
             cv2.imwrite(fname, display)
             print(f"截图保存: {fname}")
         elif key == ord('k'):
-            if _calib_state != 'IDLE':
-                _calib_state = 'IDLE'
-                _calib_buf = ''
-                print("[Dist] 标定已取消")
-            elif show_warp and M is not None:
-                _calib_state = 'W_ENTER'
-                _calib_buf = ''
-                _dist_mode = False
-                print("[Dist] 标定开始 → 输入桌子宽度（角标0 到 角标1 的实际距离，cm）")
+            if _dist_scale_x and _dist_scale_y:
+                tw = WARP_W * _dist_scale_x
+                th = WARP_H * _dist_scale_y
+                print(f"[Dist] 比例尺: x={_dist_scale_x:.4f} cm/px  y={_dist_scale_y:.4f} cm/px")
+                print(f"[Dist] 推算桌面尺寸: {tw:.1f} cm × {th:.1f} cm  (仅凭 ArUco {ARUCO_REAL_SIZE_CM} cm 推算)")
             else:
-                print("[Dist] 请先按 'w' 进入俯视图")
+                print("[Dist] 尚未推算比例尺，请先按 'w' 进入俯视图并确保4个角标可见")
         elif key == ord('p'):
-            if _calib_state == 'IDLE' and show_warp and M is not None:
+            if show_warp and M is not None:
                 _dist_mode = not _dist_mode
                 if not _dist_mode:
                     _dist_pt_a = None
