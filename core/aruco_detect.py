@@ -15,8 +15,10 @@ import cv2
 import numpy as np
 import time
 import os
+import csv
 import signal
 import threading
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,8 +60,22 @@ _smooth_corners: dict = {}   # {id: {'cx': float, 'cy': float, 'pts': ndarray, '
 # The old code loaded a constant from JSON; now we compute per-frame but smooth heavily.
 SCALE_SMOOTH_ALPHA = 0.05
 
-# 矫正后输出画面大小
-WARP_W, WARP_H = 600, 600
+# ── Rectified (top-down) view size ────────────────────────────────────
+# The rectified view must show the table at its TRUE aspect ratio with SQUARE
+# pixels (1 px = the same real distance on both axes).  We don't know the
+# table's real proportions until the 4 ArUco corners are seen, so we start with
+# a provisional square and re-lock the dimensions once the per-axis scale is
+# known (see _lock_aspect_ratio / the main loop).
+WARP_BASE = 600                          # long-side resolution of the view
+WARP_W, WARP_H = WARP_BASE, WARP_BASE    # updated once the real ratio is known
+_aspect_locked = False                   # True after dims match the table ratio
+
+# The track-segmentation pipeline (auto_detect_track_mask) is tuned for a SQUARE
+# canvas, so it always runs at MASK_DIM×MASK_DIM regardless of the view's aspect
+# ratio or WARP_BASE; only the final track-width expansion is mapped back to the
+# real view.  Kept FIXED (not tied to WARP_BASE) so raising WARP_BASE for finer
+# measurement never disturbs the mask tuning.
+MASK_DIM = 600
 
 # 轨道掩膜均匀化：骨架线 + 固定宽度膨胀
 TRACK_HALF_WIDTH = 14   # px — final uniform half-width in the 600×600 mask
@@ -94,11 +110,30 @@ _dynamic_sign_rois = []    # (x1,y1,x2,y2) boxes in warped 600×600 space; set b
 # All other distances are inferred automatically from this single constant.
 ARUCO_REAL_SIZE_CM = 10.5
 
+# Optional fixed scale-correction factor.  A 1.0101 factor was tried (one
+# 19-point session read 1 % short) but validation showed the ArUco scale itself
+# drifts ~3 % between sessions / after disturbing the setup — a FIXED factor
+# can't correct a DRIFTING scale, so it is disabled (=1.0).  The real accuracy
+# limit is scale repeatability; see the scale-stability study ('j' key →
+# evaluation/scale_repeatability.csv).
+SCALE_CALIBRATION = 1.0
+
 _dist_mode    = False      # True while user is clicking measurement points
 _dist_pt_a    = None       # first click in warped 600×600 space
 _dist_pt_b    = None       # second click
 _dist_scale_x = None       # cm per pixel along x-axis (auto-derived)
 _dist_scale_y = None       # cm per pixel along y-axis (auto-derived)
+_logging_busy = False      # True while a background 'l' prompt is awaiting input
+_mount_height = None       # camera height above table (cm); set via --height, logged by 'j'
+
+# Measurement log for accuracy (Task 2) + repeatability (Task 4) studies.
+# Each 'l' keypress appends the current A–B measurement plus a label and the
+# tape-measured ground truth; evaluation/accuracy_eval.py crunches the file.
+MEASURE_LOG = str(ROOT / "evaluation" / "measurements.csv")
+
+# Scale-stability log ('j' keypress): one row per read of the ArUco-derived
+# scale, for the scale-repeatability study (read → disturb setup → read → …).
+SCALE_LOG = str(ROOT / "evaluation" / "scale_repeatability.csv")
 
 
 def _trigger_sign_detection(warped_snap):
@@ -305,7 +340,62 @@ def compute_scale_from_aruco(markers, M):
             y_scales.append(ARUCO_REAL_SIZE_CM / y_ext)
     if not x_scales or not y_scales:
         return None, None
-    return float(np.mean(x_scales)), float(np.mean(y_scales))
+    # Apply the empirical scale calibration so measured distances are unbiased.
+    return (float(np.mean(x_scales)) * SCALE_CALIBRATION,
+            float(np.mean(y_scales)) * SCALE_CALIBRATION)
+
+
+def _lock_aspect_ratio(sx, sy):
+    """
+    Fix WARP_W / WARP_H so the rectified view has SQUARE pixels at the table's
+    TRUE aspect ratio.
+
+    Until now the view was a provisional square, which anisotropically stretched
+    a non-square table (sx ≠ sy → a circle on the table renders as an ellipse).
+    Given the per-axis cm/px from the ArUco markers, the real aspect ratio is
+    sx : sy.  Keep the longer physical axis at WARP_BASE px and scale the shorter
+    one down, so 1 px maps to the same real distance on both axes and the
+    on-screen view is geometrically faithful.  Called once, then frozen.
+    """
+    global WARP_W, WARP_H, _aspect_locked
+    if not sx or not sy or sx <= 0 or sy <= 0:
+        return False
+    if sx >= sy:                       # x is the longer / coarser axis
+        WARP_W = WARP_BASE
+        WARP_H = max(1, int(round(WARP_BASE * sy / sx)))
+    else:                              # y is the longer / coarser axis
+        WARP_H = WARP_BASE
+        WARP_W = max(1, int(round(WARP_BASE * sx / sy)))
+    _aspect_locked = True
+    ratio = max(WARP_W, WARP_H) / max(1, min(WARP_W, WARP_H))
+    print(f"[Aspect] Rectified view locked to {WARP_W}x{WARP_H} px "
+          f"(true table ratio {ratio:.2f}:1, square pixels)")
+    return True
+
+
+def camera_gsd_from_markers(markers):
+    """
+    Ground sampling distance in cm per CAMERA pixel at the table plane, measured
+    from the ArUco markers in the ORIGINAL (un-warped) frame.
+
+    Each corner marker is ARUCO_REAL_SIZE_CM on a side; its mean side length in
+    camera pixels gives cm/px at the table.  This is the sensor's true physical
+    resolution — the analytical-precision anchor (GSD = H / f).  It is DISTINCT
+    from the warp scale (_dist_scale_x/y), which is only as fine as the
+    WARP_BASE-pixel rectified view and is usually coarser.
+    """
+    gsds = []
+    for mid in CORNER_IDS:
+        if mid not in markers:
+            continue
+        pts = markers[mid][2].astype(np.float32)   # 4 corners in the original frame
+        sides = [float(np.linalg.norm(pts[i] - pts[(i + 1) % 4])) for i in range(4)]
+        side_px = float(np.mean(sides))
+        if side_px > 1:
+            gsds.append(ARUCO_REAL_SIZE_CM / side_px)
+    if not gsds:
+        return None
+    return float(np.mean(gsds))
 
 
 def draw_raw(frame, markers, ids, corners):
@@ -503,21 +593,34 @@ def _smooth_ring_contours(mask, sigma=12):
 
 def auto_detect_track_mask(warped, car_pos=None, sign_boxes=None):
     """
-    Automatically segment the track from a 600×600 warped top-down view.
+    Automatically segment the track from the warped top-down view.
+
+    The whole segmentation pipeline is tuned for a SQUARE canvas, so the (now
+    possibly non-square, true-aspect) input is squared to MASK_DIM×MASK_DIM here,
+    processed exactly as before, and only the final uniform-width skeleton is
+    resized back to the real view — where the dilation runs, so the track band
+    is uniform in real units (square pixels).
 
     Approach:
       1. Mask car ArUco only before Otsu (preserves track through sign areas).
       2. Dual-polarity Otsu + morphological clean-up.
-      3. Locate signs via YOLO (uses sign_boxes if provided, else runs YOLO here)
-         and replace each sign blob with a thin bridging line (_bridge_sign_roi).
+      3. Erase YOLO sign+tape regions, then distance-transform ridge skeleton.
     """
-    img = warped.copy()
+    # Square the inputs (true-aspect → square). car_pos and sign_boxes arrive in
+    # true-aspect view coords, so scale them into the square canvas by the same
+    # factors (sxr, syr); the mask is mapped back to the view at the end.
+    src_w = max(1, warped.shape[1])
+    src_h = max(1, warped.shape[0])
+    sxr = MASK_DIM / src_w
+    syr = MASK_DIM / src_h
+    img = cv2.resize(warped, (MASK_DIM, MASK_DIM))
 
     if car_pos is not None:
-        cv2.circle(img, (int(car_pos[0]), int(car_pos[1])), 40, (180, 180, 180), -1)
+        cv2.circle(img, (int(car_pos[0] * sxr), int(car_pos[1] * syr)),
+                   40, (180, 180, 180), -1)
 
     # ── Downsample to 300×300 for speed ──────────────────────────────
-    small = cv2.resize(img, (WARP_W // 2, WARP_H // 2), interpolation=cv2.INTER_AREA)
+    small = cv2.resize(img, (MASK_DIM // 2, MASK_DIM // 2), interpolation=cv2.INTER_AREA)
 
     # Blank the 4 ArUco corner markers in the downsampled warped image.
     # They are dark stickers → white in BINARY_INV → appear as track bumps.
@@ -562,15 +665,19 @@ def auto_detect_track_mask(warped, car_pos=None, sign_boxes=None):
     # fill-pixels appear white in BINARY_INV and merge with the track edge,
     # causing the left/right "overflow" seen in the mask.
     _h, _w = seg_raw.shape
-    _brd = 15
+    # Border/corner clears scale with the (now possibly non-square) frame so the
+    # short axis of a thin table isn't over-erased. 0.05·min-dim reproduces the
+    # original 15 px at 300×300 and shrinks proportionally for a thin table.
+    _brd = max(4, int(round(0.05 * min(_h, _w))))
     seg_raw[:_brd, :]  = 0
     seg_raw[-_brd:, :] = 0
     seg_raw[:, :_brd]  = 0
     seg_raw[:, -_brd:] = 0
 
-    # Blank the four image corners (radius 45 px) — environment outside the
-    # table that leaks into the warp corners after the border is cleared.
-    _cr = 45
+    # Blank the four image corners — environment outside the table that leaks
+    # into the warp corners after the border is cleared. 0.15·min-dim = 45 px at
+    # 300×300, scaling down for a thin table so it doesn't eat the short axis.
+    _cr = max(12, int(round(0.15 * min(_h, _w))))
     cv2.circle(seg_raw, (0,   0),   _cr, 0, -1)
     cv2.circle(seg_raw, (_w,  0),   _cr, 0, -1)
     cv2.circle(seg_raw, (0,   _h),  _cr, 0, -1)
@@ -579,20 +686,22 @@ def auto_detect_track_mask(warped, car_pos=None, sign_boxes=None):
     # Remove blobs disconnected from the main ring.
     # • The ring (all 4 sides connected) = ~13 000 px at 300×300.
     # • "COMSYS 306" text blob (adaptive detected) = ~2 000–3 000 px.
-    # Threshold at 3 000 px safely drops text without cutting ring sections.
+    # Threshold at ~3.3% of the frame (≈3 000 px at 300×300) safely drops text
+    # without cutting ring sections, and adapts to a non-square frame.
+    min_blob = int(0.033 * seg_raw.size)
     n_lbl, lbl_map, stats, _ = cv2.connectedComponentsWithStats(seg_raw, connectivity=8)
     seg_filt = np.zeros_like(seg_raw)
     for lbl in range(1, n_lbl):
-        if stats[lbl, cv2.CC_STAT_AREA] >= 3000:
+        if stats[lbl, cv2.CC_STAT_AREA] >= min_blob:
             seg_filt[lbl_map == lbl] = 255
     seg_raw = seg_filt
 
     # Debug: save segmentation before skeleton
     cv2.imwrite(str(ROOT / "debug_otsu.png"),
-                cv2.resize(seg_raw, (WARP_W, WARP_H), interpolation=cv2.INTER_NEAREST))
+                cv2.resize(seg_raw, (MASK_DIM, MASK_DIM), interpolation=cv2.INTER_NEAREST))
 
-    # ── Upsample ──────────────────────────────────────────────────────
-    clean = cv2.resize(seg_raw, (WARP_W, WARP_H), interpolation=cv2.INTER_NEAREST)
+    # ── Upsample (still square) ───────────────────────────────────────
+    clean = cv2.resize(seg_raw, (MASK_DIM, MASK_DIM), interpolation=cv2.INTER_NEAREST)
 
     # ── Identify sign sticker boxes early (needed for tape removal) ──
     if sign_boxes is None:
@@ -610,9 +719,11 @@ def auto_detect_track_mask(warped, car_pos=None, sign_boxes=None):
     TAPE_PAD = 20
     padded_rois = []
     for b in sticker_boxes:
-        x1, y1, x2, y2 = b[0], b[1], b[2], b[3]
+        # sign boxes are in true-aspect view coords → scale into the square canvas
+        x1, y1 = int(b[0] * sxr), int(b[1] * syr)
+        x2, y2 = int(b[2] * sxr), int(b[3] * syr)
         px1 = max(0, x1 - TAPE_PAD);  py1 = max(0, y1 - TAPE_PAD)
-        px2 = min(WARP_W, x2 + TAPE_PAD); py2 = min(WARP_H, y2 + TAPE_PAD)
+        px2 = min(MASK_DIM, x2 + TAPE_PAD); py2 = min(MASK_DIM, y2 + TAPE_PAD)
         cv2.rectangle(clean, (px1, py1), (px2, py2), 0, -1)
         padded_rois.append((px1, py1, px2, py2))
 
@@ -628,6 +739,10 @@ def auto_detect_track_mask(warped, car_pos=None, sign_boxes=None):
                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
 
     cv2.imwrite(str(ROOT / "debug_ridge.png"), ridge)
+
+    # Map the thin skeleton back to the true-aspect view BEFORE expanding, so the
+    # band comes out uniform in real units (square pixels), not uniform-in-square.
+    ridge = cv2.resize(ridge, (WARP_W, WARP_H), interpolation=cv2.INTER_NEAREST)
 
     # Expand skeleton to uniform TRACK_HALF_WIDTH.
     dk    = cv2.getStructuringElement(
@@ -766,6 +881,9 @@ def draw_warped(frame, markers, M, saved_mask=None):
     global _stop_event
     warped = cv2.warpPerspective(frame, M, (WARP_W, WARP_H))
 
+    # 'h' 隐藏信息文字/检测框，测距点标记点时不被遮挡（测距叠加层始终保留）
+    hud = draw_warped._show_hud
+
     # 在矫正图上标出小车
     if CAR_ID in markers:
         cx, cy, _ = markers[CAR_ID]
@@ -775,51 +893,54 @@ def draw_warped(frame, markers, M, saved_mask=None):
             status_text = "ON TRACK" if on_track else "OFF TRACK"
             status_color = (0, 255, 0) if on_track else (0, 0, 255)
 
-            # 小车位置圆圈
+            # 小车位置圆圈（始终保留）
             cv2.circle(warped, (wx, wy), 18, status_color, 3)
             cv2.circle(warped, (wx, wy), 5, status_color, -1)
-            cv2.putText(warped, f"CAR ({wx},{wy})", (wx + 20, wy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
-            cv2.putText(warped, f"CAR ({wx},{wy})", (wx + 20, wy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2)
+            if hud:
+                cv2.putText(warped, f"CAR ({wx},{wy})", (wx + 20, wy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4)
+                cv2.putText(warped, f"CAR ({wx},{wy})", (wx + 20, wy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2)
 
-            # 大字显示 ON/OFF TRACK
-            cv2.putText(warped, status_text, (10, WARP_H - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 5)
-            cv2.putText(warped, status_text, (10, WARP_H - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3)
+                # 大字显示 ON/OFF TRACK
+                cv2.putText(warped, status_text, (10, WARP_H - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 5)
+                cv2.putText(warped, status_text, (10, WARP_H - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3)
 
     # STOP compliance event display (2-second timeout)
-    if time.perf_counter() < _stop_event['until']:
+    if hud and time.perf_counter() < _stop_event['until']:
         ev = _stop_event
         cv2.putText(warped, ev['text'], (10, WARP_H - 48),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 5)
         cv2.putText(warped, ev['text'], (10, WARP_H - 48),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, ev['color'], 2)
 
-    # 画边框
+    # 画边框（始终保留，方便看到边界）
     cv2.rectangle(warped, (0, 0), (WARP_W - 1, WARP_H - 1), (0, 255, 255), 2)
-    cv2.putText(warped, "Top-Down View", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-    # Show inferred table size — derived purely from the 10.5 cm ArUco markers
-    if _dist_scale_x and _dist_scale_y:
-        tw = WARP_W * _dist_scale_x
-        th = WARP_H * _dist_scale_y
-        size_text = f"Table: {tw:.0f} x {th:.0f} cm"
-        cv2.putText(warped, size_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-        cv2.putText(warped, size_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    if hud:
+        cv2.putText(warped, "Top-Down View", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        # Show inferred table size — derived purely from the 10.5 cm ArUco markers
+        if _dist_scale_x and _dist_scale_y:
+            tw = WARP_W * _dist_scale_x
+            th = WARP_H * _dist_scale_y
+            size_text = f"Table: {tw:.0f} x {th:.0f} cm"
+            cv2.putText(warped, size_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+            cv2.putText(warped, size_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
     # Track mask status indicator (bottom-left)
-    if saved_mask is not None:
-        mask_text, mask_color = "TRACK: detected", (0, 220, 0)
-    elif _mask_running:
-        mask_text, mask_color = "TRACK: detecting...", (0, 165, 255)
-    else:
-        mask_text, mask_color = "TRACK: press c", (80, 80, 80)
-    cv2.putText(warped, mask_text, (10, WARP_H - 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-    cv2.putText(warped, mask_text, (10, WARP_H - 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, mask_color, 1)
+    if hud:
+        if saved_mask is not None:
+            mask_text, mask_color = "TRACK: detected", (0, 220, 0)
+        elif _mask_running:
+            mask_text, mask_color = "TRACK: detecting...", (0, 165, 255)
+        else:
+            mask_text, mask_color = "TRACK: press c", (80, 80, 80)
+        cv2.putText(warped, mask_text, (10, WARP_H - 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+        cv2.putText(warped, mask_text, (10, WARP_H - 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, mask_color, 1)
 
     # Sign detection: background thread fires every SIGN_EVERY_N frames
     global _sign_cache, _sign_frame_cnt
@@ -840,20 +961,21 @@ def draw_warped(frame, markers, M, saved_mask=None):
         (f"[55]    {'YES' if signs['speed'] else '---'}",
          (0, 0, 255) if signs['speed'] else (120, 120, 120)),
     ]
-    for i, (text, color) in enumerate(hud_items):
-        y = 30 + i * 28
-        cv2.putText(warped, text, (WARP_W - 185, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-        cv2.putText(warped, text, (WARP_W - 185, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    if hud:
+        for i, (text, color) in enumerate(hud_items):
+            y = 30 + i * 28
+            cv2.putText(warped, text, (WARP_W - 185, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
+            cv2.putText(warped, text, (WARP_W - 185, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-    # Draw YOLO bounding boxes on detected signs
-    for x1, y1, x2, y2, label, color, *_ in signs['boxes']:
-        cv2.rectangle(warped, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(warped, label, (x1 + 3, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 4)
-        cv2.putText(warped, label, (x1 + 3, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+        # Draw YOLO bounding boxes on detected signs
+        for x1, y1, x2, y2, label, color, *_ in signs['boxes']:
+            cv2.rectangle(warped, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(warped, label, (x1 + 3, y1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 4)
+            cv2.putText(warped, label, (x1 + 3, y1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
 
     # Debug: draw dynamic sign ROIs detected by YOLO, press 'r' to toggle
     if draw_warped._show_rois:
@@ -873,6 +995,7 @@ def draw_warped(frame, markers, M, saved_mask=None):
 
 draw_warped._show_mask = False
 draw_warped._show_rois = False
+draw_warped._show_hud  = True   # 'h' toggles info overlays (keeps measurement UI)
 
 
 # ── Distance measurement helpers ──────────────────────────────────────
@@ -934,12 +1057,131 @@ def _draw_dist_overlay(img):
     return img
 
 
+def _log_measurement():
+    """
+    Log the current A–B measurement (label + tape-measured ground truth) to
+    evaluation/measurements.csv from a BACKGROUND thread.
+
+    The terminal prompt runs in a daemon thread so it never blocks the main cv2
+    loop — on macOS a blocking input() freezes the video window.  The measurement
+    values are snapshotted at keypress time, so they can't drift while the prompt
+    is open.  Only one prompt runs at a time.  Empty input (or Ctrl-D) cancels
+    without writing a row.  Feeds both studies:
+      • accuracy    — unique label per fixed point-pair + its true distance;
+      • repeatability — reuse one label (e.g. "repeat-50") across disturbed runs.
+    """
+    global _logging_busy
+    if _logging_busy:
+        print("[Log] 请先在终端完成上一条记录（输入标签和真值）")
+        return
+    if _dist_pt_a is None or _dist_pt_b is None:
+        print("[Log] 需要先按 'p' 进入测距并点击 A、B 两点再记录")
+        return
+    if not (_dist_scale_x and _dist_scale_y):
+        print("[Log] 比例尺尚未就绪，请确保 4 个角标可见")
+        return
+
+    # Snapshot everything now so it can't change while the prompt is open.
+    ax, ay = _dist_pt_a
+    bx, by = _dist_pt_b
+    sx, sy = _dist_scale_x, _dist_scale_y
+    ww, wh = WARP_W, WARP_H
+    measured_cm = float(np.hypot((bx - ax) * sx, (by - ay) * sy))
+    print(f"[Log] 已记下 measured={measured_cm:.2f}cm — 在终端输入标签和真值"
+          f"（空输入=跳过；窗口不会卡）")
+
+    _logging_busy = True
+
+    def _prompt_and_write():
+        global _logging_busy
+        try:
+            try:
+                label = input("  标签 (例: val-c1 / repeat-50): ").strip()
+                gt    = input("  实际距离 cm (没有可留空): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[Log] 已取消（未写入）")
+                return
+            if not label and not gt:
+                print("[Log] 空输入，已跳过（未写入）")
+                return
+            is_new = not os.path.exists(MEASURE_LOG)
+            os.makedirs(os.path.dirname(MEASURE_LOG), exist_ok=True)
+            with open(MEASURE_LOG, "a", newline="") as f:
+                writer = csv.writer(f)
+                if is_new:
+                    writer.writerow(["timestamp", "label", "ax", "ay", "bx", "by",
+                                     "scale_x_cmpx", "scale_y_cmpx", "warp_w", "warp_h",
+                                     "measured_cm", "ground_truth_cm"])
+                writer.writerow([datetime.now().isoformat(timespec="seconds"), label,
+                                 ax, ay, bx, by, f"{sx:.5f}", f"{sy:.5f}",
+                                 ww, wh, f"{measured_cm:.2f}", gt])
+            print(f"[Log] 记录: measured={measured_cm:.2f}cm  label='{label}'  gt='{gt}'  → {MEASURE_LOG}")
+        finally:
+            _logging_busy = False
+
+    threading.Thread(target=_prompt_and_write, daemon=True).start()
+
+
+def _log_scale(markers):
+    """
+    One-key, non-blocking log of the CURRENT ArUco-derived scale to
+    evaluation/scale_repeatability.csv — for the scale-stability study
+    (read → disturb the setup → read → repeat ~10×).
+
+    Records both the warp scale (the measurement ruler) and the raw camera GSD
+    (the marker-based source), so the spread of these across disturbances is the
+    system's scale repeatability — the true accuracy limit found in validation.
+    """
+    if not (_dist_scale_x and _dist_scale_y):
+        print("[Scale] 比例尺尚未就绪，请确保 4 个角标可见")
+        return
+    cg = camera_gsd_from_markers(markers)
+    tw, th = WARP_W * _dist_scale_x, WARP_H * _dist_scale_y
+
+    trial = 1
+    if os.path.exists(SCALE_LOG):
+        with open(SCALE_LOG) as f:
+            trial = max(1, sum(1 for _ in f))   # header + n data rows → next trial = n+1
+
+    os.makedirs(os.path.dirname(SCALE_LOG), exist_ok=True)
+    is_new = not os.path.exists(SCALE_LOG)
+    with open(SCALE_LOG, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["timestamp", "trial", "scale_x_cmpx", "scale_y_cmpx",
+                             "table_w_cm", "table_h_cm", "camera_gsd_cmpx",
+                             "warp_w", "warp_h", "height_cm"])
+            trial = 1
+        writer.writerow([datetime.now().isoformat(timespec="seconds"), trial,
+                         f"{_dist_scale_x:.5f}", f"{_dist_scale_y:.5f}",
+                         f"{tw:.1f}", f"{th:.1f}",
+                         f"{cg:.5f}" if cg else "", WARP_W, WARP_H,
+                         _mount_height if _mount_height is not None else ""])
+    hstr = f"  H={_mount_height}cm" if _mount_height is not None else ""
+    print(f"[Scale] 记录 #{trial}: scale_x={_dist_scale_x:.4f} scale_y={_dist_scale_y:.4f}  "
+          f"cam_gsd={cg:.4f}  桌面={tw:.1f}x{th:.1f}cm{hstr}  → {SCALE_LOG}")
+
+
 def main():
+    # Rectified-view resolution is overridable at launch; declare the globals up
+    # front (before the argparse default reads WARP_BASE).
+    global WARP_BASE, WARP_W, WARP_H, _mount_height
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=int, default=None,
                         help="摄像头编号（不指定则列出所有摄像头）")
+    parser.add_argument("--warp-base", type=int, default=WARP_BASE,
+                        help="俯视图长边像素（默认600；测量研究可调大如1520，更细但更慢）")
+    parser.add_argument("--height", type=float, default=None,
+                        help="相机镜头到桌面高度(cm)，精密度-高度扫描用；按 'j' 记录时写入 height_cm 列")
     args = parser.parse_args()
+
+    # Higher WARP_BASE = finer measurement quantisation (approaches the camera
+    # GSD) at the cost of FPS; the mask still runs at the fixed MASK_DIM canvas,
+    # so its tuning is unaffected.
+    WARP_BASE = args.warp_base
+    WARP_W, WARP_H = WARP_BASE, WARP_BASE
+    _mount_height = args.height
 
     if args.source is None:
         # Only scan when user hasn't specified a source
@@ -960,7 +1202,7 @@ def main():
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"使用摄像头: {w}x{h}")
-    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  'd'=畸变对比  's'=截图  'k'=显示比例  'p'=测距  'q'=退出")
+    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  'h'=隐藏文字  'd'=畸变对比  's'=截图  'k'=显示比例  'j'=记比例尺  'p'=测距  'l'=记录测量  'q'=退出")
 
     # 预计算畸变矫正映射表
     map1, map2, roi = build_undistort_maps(h, w)
@@ -1069,6 +1311,17 @@ def main():
             M = get_perspective_transform(markers)
             _M_stable_frames += 1
             sx, sy = compute_scale_from_aruco(markers, M)
+
+            # Once the corners are stable, lock the rectified view to the real
+            # table aspect ratio (square pixels). Done once; afterwards sx ≈ sy.
+            if sx is not None and not _aspect_locked and _M_stable_frames >= 15:
+                if _lock_aspect_ratio(sx, sy):
+                    M = get_perspective_transform(markers)         # rebuild at locked dims
+                    sx, sy = compute_scale_from_aruco(markers, M)  # now ~isotropic
+                    _dist_scale_x = _dist_scale_y = None           # re-init EMA to new scale
+                    saved_mask = None                              # geometry changed → re-detect
+                    _first_detect_done = False
+
             if sx is not None:
                 if _dist_scale_x is None:
                     _dist_scale_x, _dist_scale_y = sx, sy          # first frame: init directly
@@ -1102,20 +1355,21 @@ def main():
                 cv2.putText(display, "Need all 4 corner markers", (10, h - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        # HUD
-        found_corners = [i for i in [0, 1, 2, 3] if i in markers]
-        car_found = CAR_ID in markers
-        cv2.putText(display, f"FPS: {fps:.1f}", (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(display, f"Corners: {len(found_corners)}/4  {found_corners}",
-                    (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (0, 255, 0) if len(found_corners) == 4 else (0, 165, 255), 2)
-        cv2.putText(display, f"Car: {'Detected' if car_found else 'Not found'}",
-                    (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (0, 255, 0) if car_found else (80, 80, 80), 2)
-        mode_text = "Mode: Warp" if (show_warp and M is not None) else "Mode: Raw"
-        cv2.putText(display, mode_text, (10, 109),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        # HUD（'h' 可隐藏，避免遮挡左上角的标记点）
+        if draw_warped._show_hud:
+            found_corners = [i for i in [0, 1, 2, 3] if i in markers]
+            car_found = CAR_ID in markers
+            cv2.putText(display, f"FPS: {fps:.1f}", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(display, f"Corners: {len(found_corners)}/4  {found_corners}",
+                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 0) if len(found_corners) == 4 else (0, 165, 255), 2)
+            cv2.putText(display, f"Car: {'Detected' if car_found else 'Not found'}",
+                        (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 0) if car_found else (80, 80, 80), 2)
+            mode_text = "Mode: Warp" if (show_warp and M is not None) else "Mode: Raw"
+            cv2.putText(display, mode_text, (10, 109),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         cv2.imshow("ArUco Detection", display)
 
@@ -1146,6 +1400,10 @@ def main():
             draw_warped._show_mask = not draw_warped._show_mask
         elif key == ord('r'):
             draw_warped._show_rois = not draw_warped._show_rois
+        elif key == ord('h'):
+            # Hide/show info overlays so they don't occlude the marker points
+            draw_warped._show_hud = not draw_warped._show_hud
+            print(f"[HUD] 信息文字 {'显示' if draw_warped._show_hud else '已隐藏'}")
         elif key == ord('s'):
             shot_count += 1
             fname = os.path.join(SCREENSHOT_DIR, f"aruco_{shot_count:03d}.jpg")
@@ -1155,8 +1413,11 @@ def main():
             if _dist_scale_x and _dist_scale_y:
                 tw = WARP_W * _dist_scale_x
                 th = WARP_H * _dist_scale_y
-                print(f"[Dist] 比例尺: x={_dist_scale_x:.4f} cm/px  y={_dist_scale_y:.4f} cm/px")
+                print(f"[Dist] warp 比例尺: x={_dist_scale_x:.4f} cm/px  y={_dist_scale_y:.4f} cm/px  (600px 俯视图分辨率)")
                 print(f"[Dist] 推算桌面尺寸: {tw:.1f} cm × {th:.1f} cm  (仅凭 ArUco {ARUCO_REAL_SIZE_CM} cm 推算)")
+                cg = camera_gsd_from_markers(markers)
+                if cg:
+                    print(f"[Dist] 相机 GSD(原始帧): {cg:.4f} cm/px  ← 精密度分析用这个 --measured-gsd")
             else:
                 print("[Dist] 尚未推算比例尺，请先按 'w' 进入俯视图并确保4个角标可见")
         elif key == ord('p'):
@@ -1166,6 +1427,12 @@ def main():
                     _dist_pt_a = None
                     _dist_pt_b = None
                 print(f"[Dist] 测距模式 {'已开启 — 点击 A、B 两点' if _dist_mode else '已关闭'}")
+        elif key == ord('l'):
+            # Log current A–B measurement (+ ground truth) for accuracy/repeatability
+            _log_measurement()
+        elif key == ord('j'):
+            # Log the current ArUco scale for the scale-stability / repeatability study
+            _log_scale(markers)
 
     cap.release()
     cv2.destroyAllWindows()

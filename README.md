@@ -579,6 +579,34 @@ if _mask_result[0] is not None:
 
 ---
 
+### Week 13–15: Metrology Validation (Aspect Ratio · Accuracy · Precision · Repeatability)
+
+Supervisor (Kevin) requested turning the system from a demo into a *measuring instrument*: correct the display geometry, then characterise accuracy, precision and repeatability so the work has a defensible research contribution.
+
+**1. Aspect-ratio correction — true proportions with square pixels.**
+The rectified view was a fixed 600×600 square, which anisotropically stretched a non-square table (a circle rendered as an ellipse) and forced two different scales `_dist_scale_x/y`. Fix: once the 4 corners are stable, `_lock_aspect_ratio()` reads the per-axis cm/px from the ArUco markers and rebuilds the destination rectangle at the true ratio, keeping the long axis at `WARP_BASE` and scaling the short axis so **1 px = the same real distance on both axes**. After locking, `sx ≈ sy` (verified live: `x=0.2740`, `y=0.2746`). A 164×63 cm table now locks to ~600×230 (2.61:1).
+
+**2. Square-canvas mask processing.**
+The segmentation pipeline was tuned for a 600×600 square, so a 600×230 view broke it (morphology kernels ~3× oversized on the short axis → lumpy, non-uniform band). Fix: `auto_detect_track_mask()` now always processes on a fixed `MASK_DIM=600` square canvas (input squared on entry) and resizes only the **thin skeleton** back to the true-aspect view *before* the width dilation — so the band is uniform in real units. `MASK_DIM` is decoupled from `WARP_BASE`; a square table is a no-op (behaviour-preserving).
+
+**3. Camera GSD vs. warp resolution.**
+Pressing `k` now prints two distinct scales:
+- **Warp scale** (≈0.274 cm/px) — the 600 px view's quantisation step (an arbitrary rendering choice).
+- **Camera GSD** (≈0.108 cm/px @ 141 cm) — the sensor's true resolution at the table plane, measured from the ArUco marker's pixel size in the *original* frame (`camera_gsd_from_markers()`).
+
+The camera resolves ~2.5× finer than the 600 px warp, so the warp is the measurement bottleneck. `--warp-base` makes the rectified-view resolution configurable (default 600 for real-time; e.g. 1520 matches the camera GSD for high-precision measurement runs, at the cost of FPS). The mask is unaffected (fixed `MASK_DIM`).
+
+**4. Measurement + logging tooling.**
+- `p` → click A/B → live distance readout (uses the isotropic scale).
+- `l` → append the measurement + label + tape-measured ground truth to `evaluation/measurements.csv` (records `warp_w/h` for traceability).
+- `h` → hide info overlays / detection boxes so they don't occlude the marker points while clicking (measurement UI stays).
+
+**5. Analytical precision.** `evaluation/precision_analysis.py` computes GSD = H / f_live vs. camera height, empirically anchored to the ArUco-measured camera GSD (so it corrects for the webcam FOV crop vs. the photo-mode calibration). Outputs a precision (mm/px) and coverage (cm) table + CSV.
+
+**6. Accuracy / repeatability analysis.** `evaluation/accuracy_eval.py` turns the logged CSV into accuracy stats (bias, MAE, RMSE, %error, scatter vs. y=x) and repeatability stats (mean, 1σ, CV%, range) per label.
+
+---
+
 ## Key Technical Decisions
 
 | Decision | Rationale | Alternative Rejected |
@@ -645,3 +673,62 @@ if _mask_result[0] is not None:
 | Main loop FPS (YOLO fully offloaded) | **~25 FPS, no periodic stutter** |
 | Track mask detection (background thread) | ~200–400 ms, non-blocking |
 | Perspective change detection | per-frame, negligible cost |
+
+### Distance Measurement — Accuracy (600 px warp, 19 points, 10–154 cm)
+
+| Metric | Value |
+|---|---|
+| RMSE | **0.72 cm** |
+| MAE | 0.57 cm |
+| Mean \|%error\| | 1.5% |
+| Max \|error\| | 1.86 cm (@154 cm) |
+| Systematic bias (this setup) | **−0.50 cm (measured reads ~1% short)** |
+| RMSE after removing per-session scale | **0.41 cm** (random residual) |
+
+The error is almost purely a **multiplicative scale offset** (best-fit factor k = 0.9900; removing it drops RMSE to 0.41 cm, so the random residual is sub-cm). Note this offset is a **trueness** term, not a fixed constant: a second setup measured ~3% short (k ≈ 0.97), i.e. the absolute scale offset varies **1–3% between physical setups** while staying stable within a setup. It is attributed to uncorrected lens distortion at the ArUco corners, which sit near the frame periphery (see Repeatability, below). Short-range residual is quantisation-limited (0–25 cm: ~3% error; ≥60 cm: ~1%), consistent with the 0.274 cm/px warp step. Analytical sensor precision at 141 cm ≈ **1.08 mm/px** (camera GSD).
+
+![Measured vs. actual distance (left) and residuals (right) — 19-point set, 10–154 cm](evaluation/accuracy_scatter.png)
+
+### Distance Measurement — Repeatability & Scale Stability
+
+The ArUco-derived scale (the measurement "ruler") was logged repeatedly (`j` key):
+
+| Condition | scale CV (1σ) | camera GSD CV | table-width spread |
+|---|---|---|---|
+| Static (undisturbed, n = 10) | **0.11%** | 0.24% | 0.5 cm (0.3%) |
+| After disturbance (nudge camera + re-settle, n = 11) | **0.30%** | 0.20% | 1.8 cm (1.1%) |
+
+**Precision (repeatability) is excellent — ~0.3%** even after disturbing the rig; the raw camera GSD is stable to ~0.2%. This separates cleanly from the 1–3% **accuracy (trueness)** offset above: the scale is *precise but carries a setup-dependent absolute offset*. Because that offset is stable within a fixed setup, a one-time tape calibration per setup removes it; the root cause (uncorrected radial distortion at the peripheral markers) is the path to fixing it globally.
+
+![ArUco scale stability — static (CV 0.11%) vs. after-disturbance (CV 0.30%)](evaluation/scale_stability.png)
+
+### Distance Measurement — Precision vs. Height (analytical + empirical)
+
+Analytical precision is the ground sampling distance **GSD = H / f** (cm per camera pixel at the table plane), anchored empirically to the ArUco camera GSD (f ≈ 1287 px at 1920 px width). Measured camera GSD was logged (`j` key) at three mount heights — the rig only adjusts over **130–146 cm**:
+
+| Height H | Measured GSD | Analytical H/f |
+|---|---|---|
+| 130 cm | 1.046 mm/px \* | 1.010 mm/px |
+| 140 cm | 1.088 mm/px | 1.088 mm/px |
+| 146 cm | 1.109 mm/px | 1.135 mm/px |
+
+![Precision (GSD, mm/px) vs. camera height, measured points on the analytical line](evaluation/precision_vs_height.png)
+
+Measured GSD matches the analytical model in magnitude (~1 mm/px) and rises with height as expected. The fit is not tight: the achievable range (16 cm) is narrow relative to the ~3% scale noise, and **(\*) the 130 cm point is unreliable** — at that lowest height the table read 175 cm vs. the true ~164 cm, a ~7% scale error from stronger radial distortion as the corner markers move toward the frame periphery (same root cause as the accuracy offset). A wider sweep is blocked by the fixed mount range; within it the empirical GSD is consistent with the analytical model.
+
+---
+
+## Next Steps
+
+**Kevin's four asks — all delivered:** (1) aspect-ratio correction ✓; (2) accuracy calculation (RMSE 0.41–0.72 cm) ✓; (3) analytical precision GSD = H/f, empirically checked at 130/140/146 cm ✓; (4) repeatability under disturbance (0.3%) ✓. All figures generated (accuracy scatter, scale stability, precision-vs-height). The metrology is now *characterised*, not further "fixed" (a fixed 1.0101 scale patch was tried and reverted: the offset is setup-dependent, so a fixed factor is invalid).
+
+**Optional / future:**
+1. **(Accuracy improvement — beyond Kevin's ask)** Enable lens undistortion via a webcam-mode recalibration to remove the setup-dependent 1–3% trueness offset and the peripheral errors; or apply a one-time tape calibration per fixed setup.
+2. **Tighter precision-vs-height validation** is blocked by the fixed mount (130–146 cm only); it would need a rig with a wider adjustable range.
+
+**Robot integration (supervisor preparing hardware):**
+4. Drive the robot along known trajectories; log its path and compare against commanded/ground-truth motion (extends static distance accuracy to dynamic tracking accuracy).
+
+**System / deployment:**
+5. Decide default `WARP_BASE` for real-time (600) vs. measurement (≈1520) use; document the FPS trade-off.
+6. Jetson Orin deployment (original target platform) — port and re-benchmark FPS.
