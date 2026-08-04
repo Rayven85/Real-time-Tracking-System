@@ -126,6 +126,11 @@ _dist_scale_y = None       # cm per pixel along y-axis (auto-derived)
 _logging_busy = False      # True while a background 'l' prompt is awaiting input
 _mount_height = None       # camera height above table (cm); set via --height, logged by 'j'
 
+# ── Trajectory logging (dynamic tracking accuracy, 't' key) ───────────
+_traj_recording = False    # True while logging the CAR trajectory
+_traj_rows = []            # [(t_s, wx, wy, x_cm, y_cm), ...] for the current run
+_traj_t0 = None            # perf_counter() at recording start
+
 # Measurement log for accuracy (Task 2) + repeatability (Task 4) studies.
 # Each 'l' keypress appends the current A–B measurement plus a label and the
 # tape-measured ground truth; evaluation/accuracy_eval.py crunches the file.
@@ -889,6 +894,10 @@ def draw_warped(frame, markers, M, saved_mask=None):
         cx, cy, _ = markers[CAR_ID]
         wx, wy = warp_point((cx, cy), M)
         if 0 <= wx < WARP_W and 0 <= wy < WARP_H:
+            # Trajectory logging: append this frame's position while recording
+            if _traj_recording and _dist_scale_x and _dist_scale_y:
+                _traj_rows.append((round(time.perf_counter() - _traj_t0, 3), wx, wy,
+                                   round(wx * _dist_scale_x, 2), round(wy * _dist_scale_y, 2)))
             on_track = is_on_track(saved_mask, wx, wy) if saved_mask is not None else False
             status_text = "ON TRACK" if on_track else "OFF TRACK"
             status_color = (0, 255, 0) if on_track else (0, 0, 255)
@@ -1162,6 +1171,42 @@ def _log_scale(markers):
           f"cam_gsd={cg:.4f}  桌面={tw:.1f}x{th:.1f}cm{hstr}  → {SCALE_LOG}")
 
 
+def _toggle_trajectory():
+    """
+    Start/stop logging the tracked CAR trajectory to evaluation/traj_<time>.csv
+    for the dynamic tracking-accuracy test: drive the robot along a KNOWN path,
+    then compare the tracked displacement / path length against the tape truth.
+    Positions are stored in warp pixels and cm (via the ArUco scale) per frame.
+    """
+    global _traj_recording, _traj_rows, _traj_t0
+    if not _traj_recording:
+        _traj_rows = []
+        _traj_t0 = time.perf_counter()
+        _traj_recording = True
+        print("[Traj] 开始记录轨迹 — 让机器人走完路线后再按 't' 停止")
+        return
+
+    _traj_recording = False
+    if len(_traj_rows) < 2:
+        print("[Traj] 记录到的点太少（机器人码没被追到？）— 未保存")
+        return
+    fn = str(ROOT / "evaluation" / f"traj_{datetime.now():%H%M%S}.csv")
+    with open(fn, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["t_s", "wx", "wy", "x_cm", "y_cm"])
+        writer.writerows(_traj_rows)
+    x0, y0 = _traj_rows[0][3], _traj_rows[0][4]
+    x1, y1 = _traj_rows[-1][3], _traj_rows[-1][4]
+    disp = float(np.hypot(x1 - x0, y1 - y0))
+    path = sum(float(np.hypot(_traj_rows[i][3] - _traj_rows[i - 1][3],
+                              _traj_rows[i][4] - _traj_rows[i - 1][4]))
+               for i in range(1, len(_traj_rows)))
+    dur = _traj_rows[-1][0]
+    spd = path / dur if dur > 0 else 0.0
+    print(f"[Traj] 停止：{len(_traj_rows)} 点，用时 {dur:.1f}s")
+    print(f"[Traj] 首尾位移={disp:.1f}cm  路径长={path:.1f}cm  均速={spd:.1f}cm/s  → {fn}")
+
+
 def main():
     # Rectified-view resolution is overridable at launch; declare the globals up
     # front (before the argparse default reads WARP_BASE).
@@ -1202,7 +1247,7 @@ def main():
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"使用摄像头: {w}x{h}")
-    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  'h'=隐藏文字  'd'=畸变对比  's'=截图  'k'=显示比例  'j'=记比例尺  'p'=测距  'l'=记录测量  'q'=退出")
+    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  'h'=隐藏文字  'd'=畸变对比  's'=截图  'k'=显示比例  'j'=记比例尺  'p'=测距  'l'=记录测量  't'=记录轨迹  'q'=退出")
 
     # 预计算畸变矫正映射表
     map1, map2, roi = build_undistort_maps(h, w)
@@ -1433,6 +1478,9 @@ def main():
         elif key == ord('j'):
             # Log the current ArUco scale for the scale-stability / repeatability study
             _log_scale(markers)
+        elif key == ord('t'):
+            # Start/stop logging the CAR trajectory (dynamic tracking accuracy)
+            _toggle_trajectory()
 
     cap.release()
     cv2.destroyAllWindows()
