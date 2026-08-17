@@ -36,7 +36,9 @@ def load(path):
 
 
 def cross_track_rms(xs, ys):
-    """RMS perpendicular distance of each point from the start→end line (cm)."""
+    """RMS perpendicular distance of each point from the start→end line (cm).
+    Only meaningful if the TRUE path is straight (else it just measures how much
+    the robot curved).  For curved paths use jitter_rms instead."""
     ax, ay, bx, by = xs[0], ys[0], xs[-1], ys[-1]
     dx, dy = bx - ax, by - ay
     L = math.hypot(dx, dy)
@@ -45,6 +47,26 @@ def cross_track_rms(xs, ys):
     # signed perpendicular distance via 2D cross product / |AB|
     dev = [((px - ax) * dy - (py - ay) * dx) / L for px, py in zip(xs, ys)]
     return math.sqrt(sum(d * d for d in dev) / len(dev))
+
+
+def jitter_rms(xs, ys, win=5):
+    """
+    RMS deviation of each tracked point from a moving-average-smoothed path.
+
+    Real motion is smooth, so high-frequency wiggle around the smoothed path is
+    tracking jitter — independent of whether the path is straight or curved.
+    Compare slow vs. fast runs: the increase is the dynamic (motion) error.
+    """
+    n = len(xs)
+    if n < win + 2:
+        return float("nan")
+    h = win // 2
+    def smooth(v):
+        return [sum(v[max(0, i - h):min(n, i + h + 1)]) /
+                (min(n, i + h + 1) - max(0, i - h)) for i in range(n)]
+    sx, sy = smooth(xs), smooth(ys)
+    dev = [math.hypot(xs[i] - sx[i], ys[i] - sy[i]) for i in range(n)]
+    return math.sqrt(sum(d * d for d in dev) / n)
 
 
 def main():
@@ -67,6 +89,7 @@ def main():
     dur = ts[-1] - ts[0]
     spd = path / dur if dur > 0 else 0.0
     ctr = cross_track_rms(xs, ys)
+    jit = jitter_rms(xs, ys)
 
     print("=" * 60)
     print(f"TRAJECTORY  {os.path.basename(args.csv)}   ({len(xs)} points)")
@@ -75,7 +98,8 @@ def main():
     print(f"  path length (summed)     : {path:8.2f} cm")
     print(f"  duration                 : {dur:8.2f} s")
     print(f"  average speed            : {spd:8.2f} cm/s")
-    print(f"  cross-track RMS (straightness): {ctr:6.3f} cm")
+    print(f"  jitter RMS (any path)         : {jit:6.3f} cm   ← dynamic error metric")
+    print(f"  cross-track RMS (straight only): {ctr:6.3f} cm")
     if args.truth:
         for name, val in [("displacement", disp), ("path length", path)]:
             e = val - args.truth

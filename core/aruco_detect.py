@@ -326,9 +326,11 @@ def compute_scale_from_aruco(markers, M):
     Auto-derive cm-per-pixel scale using only the known ArUco marker size.
 
     Each corner marker (IDs 0-3) is ARUCO_REAL_SIZE_CM on every side.
-    Project its 4 detected corners through M into the warped 600×600 space.
-    The resulting pixel extents in x and y give cm/px independently for both
-    axes — no manual input, works for any table size or camera height.
+    Project its 4 detected corners through M into the warped space and measure
+    the marker's EDGE lengths (rotation-invariant) in x and y — these give cm/px
+    independently for both axes.  (Edge lengths, not the bounding box: a rotated
+    marker inflates the bbox and biases the scale short.)  No manual input;
+    works for any table size or camera height.
     """
     x_scales, y_scales = [], []
     for mid in CORNER_IDS:
@@ -337,12 +339,16 @@ def compute_scale_from_aruco(markers, M):
         _, _, pts = markers[mid]          # pts: (4, 2) corners in original image
         wp = cv2.perspectiveTransform(
             pts.reshape(-1, 1, 2).astype(np.float32), M).reshape(-1, 2)
-        x_ext = float(wp[:, 0].max() - wp[:, 0].min())
-        y_ext = float(wp[:, 1].max() - wp[:, 1].min())
-        if x_ext > 1:
-            x_scales.append(ARUCO_REAL_SIZE_CM / x_ext)
-        if y_ext > 1:
-            y_scales.append(ARUCO_REAL_SIZE_CM / y_ext)
+        # Use the marker's actual EDGE lengths, not the axis-aligned bounding box.
+        # A slightly rotated marker inflates the bbox extent (by cosθ+sinθ) →
+        # scale comes out too small → every distance reads short, uniformly.
+        # Corner order TL,TR,BR,BL: edges 0-1 & 2-3 span the x side, 1-2 & 3-0 the y side.
+        side_x = 0.5 * (np.linalg.norm(wp[1] - wp[0]) + np.linalg.norm(wp[2] - wp[3]))
+        side_y = 0.5 * (np.linalg.norm(wp[2] - wp[1]) + np.linalg.norm(wp[3] - wp[0]))
+        if side_x > 1:
+            x_scales.append(ARUCO_REAL_SIZE_CM / side_x)
+        if side_y > 1:
+            y_scales.append(ARUCO_REAL_SIZE_CM / side_y)
     if not x_scales or not y_scales:
         return None, None
     # Apply the empirical scale calibration so measured distances are unbiased.
@@ -1190,7 +1196,8 @@ def _toggle_trajectory():
     if len(_traj_rows) < 2:
         print("[Traj] 记录到的点太少（机器人码没被追到？）— 未保存")
         return
-    fn = str(ROOT / "evaluation" / f"traj_{datetime.now():%H%M%S}.csv")
+    # Date + time: a time-only name silently overwrites a run from another day.
+    fn = str(ROOT / "evaluation" / f"traj_{datetime.now():%Y%m%d_%H%M%S}.csv")
     with open(fn, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["t_s", "wx", "wy", "x_cm", "y_cm"])

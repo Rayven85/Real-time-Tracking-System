@@ -716,6 +716,22 @@ Analytical precision is the ground sampling distance **GSD = H / f** (cm per cam
 
 Measured GSD matches the analytical model in magnitude (~1 mm/px) and rises with height as expected. The fit is not tight: the achievable range (16 cm) is narrow relative to the ~3% scale noise, and **(\*) the 130 cm point is unreliable** — at that lowest height the table read 175 cm vs. the true ~164 cm, a ~7% scale error from stronger radial distortion as the corner markers move toward the frame periphery (same root cause as the accuracy offset). A wider sweep is blocked by the fixed mount range; within it the empirical GSD is consistent with the analytical model.
 
+### Dynamic Tracking Accuracy (moving robot)
+
+The static results above were extended to a moving target: a robot carrying an ArUco marker was driven along a **tape-measured 100 cm straight path** at three speeds, with the tracked position logged per frame (`t` key). The robot's sign-response logic was disabled so it held a constant speed.
+
+| Speed group | n | Mean speed | Measured displacement | vs. 100 cm truth | Cross-track RMS |
+|---|---|---|---|---|---|
+| Slow | 4 | 14.4 cm/s | 97.50 ± 3.57 cm | −2.5 cm | **0.37 cm** |
+| Medium | 5 | 17.5 cm/s | 99.82 ± 1.80 cm | −0.2 cm | **0.55 cm** |
+| Fast | 5 | 25.5 cm/s | 97.68 ± 5.21 cm | −2.3 cm | **0.61 cm** |
+
+![Dynamic error vs. speed (left) and measured displacement per run against the 100 cm truth (right)](evaluation/dynamic_accuracy.png)
+
+**Tracking degrades only marginally with speed.** Cross-track RMS — the deviation of the tracked path from the ideal straight line, which is independent of start/stop timing — rises from 0.37 cm to 0.61 cm as speed nearly doubles (14 → 26 cm/s). Distance accuracy while moving (−0.2 to −2.5 cm over 100 cm) is comparable to the static baseline, confirming that motion blur and pipeline latency are not limiting factors at these speeds.
+
+**Caveat:** each run was started and stopped by a manual keypress, so the *spread* in displacement is dominated by human timing, not by the tracker — at 25 cm/s a 0.2 s reaction error alone accounts for ~5 cm, which is why the fast group shows the largest standard deviation (5.21 cm) despite having the same accuracy as the others. Cross-track RMS is therefore the more reliable dynamic-error metric here.
+
 ---
 
 ## Next Steps
@@ -726,8 +742,8 @@ Measured GSD matches the analytical model in magnitude (~1 mm/px) and rises with
 1. **(Accuracy improvement — beyond Kevin's ask)** Enable lens undistortion via a webcam-mode recalibration to remove the setup-dependent 1–3% trueness offset and the peripheral errors; or apply a one-time tape calibration per fixed setup.
 2. **Tighter precision-vs-height validation** is blocked by the fixed mount (130–146 cm only); it would need a rig with a wider adjustable range.
 
-**Robot integration (supervisor preparing hardware):**
-4. Drive the robot along known trajectories; log its path and compare against commanded/ground-truth motion (extends static distance accuracy to dynamic tracking accuracy).
+**Robot integration — first results in (see Dynamic Tracking Accuracy):**
+4. Automate the run start/stop (e.g. trigger on the robot crossing marked positions) to remove the manual-keypress timing spread, and extend to curved paths.
 
 **System / deployment:**
 5. Decide default `WARP_BASE` for real-time (600) vs. measurement (≈1520) use; document the FPS trade-off.
