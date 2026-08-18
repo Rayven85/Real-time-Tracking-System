@@ -718,19 +718,34 @@ Measured GSD matches the analytical model in magnitude (~1 mm/px) and rises with
 
 ### Dynamic Tracking Accuracy (moving robot)
 
-The static results above were extended to a moving target: a robot carrying an ArUco marker was driven along a **tape-measured 100 cm straight path** at three speeds, with the tracked position logged per frame (`t` key). The robot's sign-response logic was disabled so it held a constant speed.
+The static results above were extended to a moving target: a robot carrying an ArUco marker was driven along a **tape-measured 94 cm straight path**, with the tracked position logged per frame (`t` key). The robot's sign-response logic was disabled so it held a constant speed.
 
-| Speed group | n | Mean speed | Measured displacement | vs. 100 cm truth | Cross-track RMS |
-|---|---|---|---|---|---|
-| Slow | 4 | 14.4 cm/s | 97.50 ± 3.57 cm | −2.5 cm | **0.37 cm** |
-| Medium | 5 | 17.5 cm/s | 99.82 ± 1.80 cm | −0.2 cm | **0.55 cm** |
-| Fast | 5 | 25.5 cm/s | 97.68 ± 5.21 cm | −2.3 cm | **0.61 cm** |
+**Measurement protocol — parked endpoints.** An earlier batch started and stopped recording on a manual keypress, which dominated the run-to-run spread (at 25 cm/s a 0.2 s reaction error is ~5 cm). In the runs reported here the robot is held **still for 1–2 s at each end**, so `trajectory_eval.py --gates` recovers each endpoint as the average of its stationary frames: the measurement no longer depends on *when* the key was pressed, and averaging over the parked frames also suppresses position noise. Trip-line gates were considered and rejected — the lines would live in tracked coordinates, so a constant tracking bias cancels between them and the result reduces to the distance between the two clicked points.
 
-![Dynamic error vs. speed (left) and measured displacement per run against the 100 cm truth (right)](evaluation/dynamic_accuracy.png)
+**23 runs, 3.3–11.3 cm/s** (4 further runs were discarded — started from the wrong mark):
 
-**Tracking degrades only marginally with speed.** Cross-track RMS — the deviation of the tracked path from the ideal straight line, which is independent of start/stop timing — rises from 0.37 cm to 0.61 cm as speed nearly doubles (14 → 26 cm/s). Distance accuracy while moving (−0.2 to −2.5 cm over 100 cm) is comparable to the static baseline, confirming that motion blur and pipeline latency are not limiting factors at these speeds.
+| Speed group | n | Mean speed | Measured displacement | Cross-track RMS |
+|---|---|---|---|---|
+| Slow | 7 | 3.6 cm/s | 96.54 ± 0.51 cm | 0.29 cm |
+| Medium | 10 | 6.2 cm/s | 97.20 ± 0.43 cm | 0.25 cm |
+| Fast | 6 | 9.5 cm/s | 97.65 ± 0.45 cm | 0.16 cm |
+| **All** | **23** | — | **97.12 ± 0.62 cm (CV 0.63%)** | 0.24 cm |
 
-**Caveat:** each run was started and stopped by a manual keypress, so the *spread* in displacement is dominated by human timing, not by the tracker — at 25 cm/s a 0.2 s reaction error alone accounts for ~5 cm, which is why the fast group shows the largest standard deviation (5.21 cm) despite having the same accuracy as the others. Cross-track RMS is therefore the more reliable dynamic-error metric here.
+![Measured displacement per run against the 94 cm truth (left) and cross-track RMS vs. speed (right)](evaluation/dynamic_accuracy.png)
+
+**Repeatability under motion is the headline: ±0.62 cm (CV 0.63%) across 23 runs**, with no degradation as speed triples — cross-track RMS actually *falls* with speed (0.29 → 0.16 cm), as slower runs give the robot's line-following more time to weave. Motion blur and pipeline latency are therefore not limiting factors over this speed range.
+
+**Systematic offset, decomposed.** The measured mean sits **+3.32% above the 94 cm truth**, which resolves into two quantified effects of opposite sign that partially cancel:
+
+| Effect | Magnitude | Basis |
+|---|---|---|
+| Parallax — marker 11 cm above the table plane | **+8.15%** | H/(H−h) = 146/135, geometric |
+| Scale offset | **−5.11%** | measured: clicking the same two marks on the table plane reads 89.2 cm vs. 94 cm |
+| **Net** | **+3.32%** | 94 × 0.9489 × 1.0815 = 96.47 cm predicted vs. 97.12 cm observed |
+
+The parallax term is expected and fully explained: the homography maps to the table plane, so a marker riding 11 cm above it is magnified. **The −5.11% scale offset was verified but its origin was not established** — the corner markers were confirmed to be 10.5 cm as assumed, and coplanar with the reference marks. It is common to all runs, so it shifts the mean without affecting the repeatability figure above. Note the two effects nearly cancelling is a reminder that a small net error can hide larger opposing ones.
+
+**Residual speed trend.** Measured displacement rises ~1.1 cm from the slow to the fast group. This is most likely the robot's own stopping behaviour — overshooting the end mark further at higher speed — rather than a tracking effect, since the cross-track RMS moves in the opposite direction.
 
 ---
 
@@ -742,8 +757,8 @@ The static results above were extended to a moving target: a robot carrying an A
 1. **(Accuracy improvement — beyond Kevin's ask)** Enable lens undistortion via a webcam-mode recalibration to remove the setup-dependent 1–3% trueness offset and the peripheral errors; or apply a one-time tape calibration per fixed setup.
 2. **Tighter precision-vs-height validation** is blocked by the fixed mount (130–146 cm only); it would need a rig with a wider adjustable range.
 
-**Robot integration — first results in (see Dynamic Tracking Accuracy):**
-4. Automate the run start/stop (e.g. trigger on the robot crossing marked positions) to remove the manual-keypress timing spread, and extend to curved paths.
+**Robot / dynamic tracking — delivered (see Dynamic Tracking Accuracy):**
+4. Remaining threads: identify the source of the −5.11% scale offset; extend the speed range beyond 11 cm/s and to curved paths; mount the marker lower (or divide by H/(H−h)) to remove the parallax term.
 
 **System / deployment:**
 5. Decide default `WARP_BASE` for real-time (600) vs. measurement (≈1520) use; document the FPS trade-off.
