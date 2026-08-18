@@ -126,6 +126,15 @@ _dist_scale_y = None       # cm per pixel along y-axis (auto-derived)
 _logging_busy = False      # True while a background 'l' prompt is awaiting input
 _mount_height = None       # camera height above table (cm); set via --height, logged by 'j'
 
+# ── CAR detection-rate monitor ────────────────────────────────────────
+# The corner markers get EMA smoothing + persistence (_stabilise_corners), so
+# their flicker is hidden; the car marker is deliberately raw — smoothing it
+# would add speed-dependent lag and corrupt the very dynamic error we measure.
+# This rolling hit-rate exposes the underlying detection reliability so lighting
+# / marker changes can be judged live, and a bad run spotted before analysis.
+CAR_RATE_WINDOW = 100
+_car_hits: list = []
+
 # ── Trajectory logging (dynamic tracking accuracy, 't' key) ───────────
 _traj_recording = False    # True while logging the CAR trajectory
 _traj_rows = []            # [(t_s, wx, wy, x_cm, y_cm), ...] for the current run
@@ -1042,8 +1051,9 @@ def _draw_dist_overlay(img):
     hint = ('[DIST] Click A' if _dist_pt_a is None else
             '[DIST] Click B' if _dist_pt_b is None else
             '[DIST] Click to reset')
-    cv2.putText(img, hint, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-    cv2.putText(img, hint, (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    # y=167 keeps clear of the main HUD, whose last line now sits at y=136
+    cv2.putText(img, hint, (10, 167), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+    cv2.putText(img, hint, (10, 167), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
     # ── Measurement points and result ─────────────────────────────────
     if _dist_pt_a is not None:
@@ -1407,10 +1417,16 @@ def main():
                 cv2.putText(display, "Need all 4 corner markers", (10, h - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
+        # Track the CAR hit-rate every frame, whether or not the HUD is shown.
+        car_found = CAR_ID in markers
+        _car_hits.append(car_found)
+        if len(_car_hits) > CAR_RATE_WINDOW:
+            _car_hits.pop(0)
+        car_rate = 100.0 * sum(_car_hits) / len(_car_hits)
+
         # HUD（'h' 可隐藏，避免遮挡左上角的标记点）
         if draw_warped._show_hud:
             found_corners = [i for i in [0, 1, 2, 3] if i in markers]
-            car_found = CAR_ID in markers
             cv2.putText(display, f"FPS: {fps:.1f}", (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(display, f"Corners: {len(found_corners)}/4  {found_corners}",
@@ -1419,8 +1435,13 @@ def main():
             cv2.putText(display, f"Car: {'Detected' if car_found else 'Not found'}",
                         (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (0, 255, 0) if car_found else (80, 80, 80), 2)
+            # Rolling detection rate — green ≥90%, orange ≥70%, red below
+            rate_color = ((0, 255, 0) if car_rate >= 90 else
+                          (0, 165, 255) if car_rate >= 70 else (0, 0, 255))
+            cv2.putText(display, f"Detect: {car_rate:.0f}% (last {len(_car_hits)}f)",
+                        (10, 109), cv2.FONT_HERSHEY_SIMPLEX, 0.6, rate_color, 2)
             mode_text = "Mode: Warp" if (show_warp and M is not None) else "Mode: Raw"
-            cv2.putText(display, mode_text, (10, 109),
+            cv2.putText(display, mode_text, (10, 136),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         cv2.imshow("ArUco Detection", display)

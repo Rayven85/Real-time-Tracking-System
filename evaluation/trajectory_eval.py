@@ -69,6 +69,41 @@ def jitter_rms(xs, ys, win=5):
     return math.sqrt(sum(d * d for d in dev) / n)
 
 
+def stationary_endpoints(ts, xs, ys, radius=2.0, min_frames=3):
+    """
+    Find the parked position at each end of a run, so the measurement no longer
+    depends on WHEN 't' was pressed.
+
+    Record with the target held still for ~1-2 s at both ends: this locates those
+    stationary runs of frames (speed < v_thresh) and averages the position over
+    each, which both pins the true endpoints and averages down position noise.
+
+    Returns (A, B, nA, nB) with A/B as (x, y) in cm, or (None, None, nA, nB) if
+    either end has too few stationary frames — meaning the run was already moving
+    when recording started/stopped and its true endpoints weren't captured.
+
+    Parked frames are those staying within `radius` of the first (resp. last)
+    position — a distance test, not a per-frame speed test: position noise makes a
+    parked target look like it is creeping, which would cut the run short and
+    waste the frames available for averaging.
+    """
+    n = len(xs)
+    i = 0
+    while i < n and math.hypot(xs[i] - xs[0], ys[i] - ys[0]) <= radius:
+        i += 1
+    j = n - 1
+    while j >= 0 and math.hypot(xs[j] - xs[-1], ys[j] - ys[-1]) <= radius:
+        j -= 1
+    nA, nB = i, n - 1 - j
+    if i > j:          # whole run inside one radius — target never really moved
+        return None, None, nA, nB
+    if nA < min_frames or nB < min_frames:
+        return None, None, nA, nB
+    A = (sum(xs[:i]) / i, sum(ys[:i]) / i)
+    B = (sum(xs[j + 1:]) / nB, sum(ys[j + 1:]) / nB)
+    return A, B, nA, nB
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -76,6 +111,9 @@ def main():
     ap.add_argument("--truth", type=float, default=None,
                     help="tape-measured true path length (cm) for accuracy")
     ap.add_argument("--plot", action="store_true", help="save a 2D path figure")
+    ap.add_argument("--gates", action="store_true",
+                    help="measure between the averaged stationary endpoints "
+                         "(removes start/stop keypress timing error)")
     args = ap.parse_args()
 
     if not os.path.exists(args.csv):
@@ -100,6 +138,27 @@ def main():
     print(f"  average speed            : {spd:8.2f} cm/s")
     print(f"  jitter RMS (any path)         : {jit:6.3f} cm   ← dynamic error metric")
     print(f"  cross-track RMS (straight only): {ctr:6.3f} cm")
+
+    if args.gates:
+        A, B, nA, nB = stationary_endpoints(ts, xs, ys)
+        print()
+        if A is None:
+            print(f"  [gates] no stationary frames at the ends "
+                  f"(start {nA}, end {nB}) — the run was already moving when")
+            print(f"          recording started/stopped, so the true endpoints "
+                  f"weren't captured.")
+            print(f"          Re-record holding the target still ~1-2 s before "
+                  f"and after the run.")
+        else:
+            gd = math.hypot(B[0] - A[0], B[1] - A[1])
+            print(f"  [gates] parked A=({A[0]:.2f},{A[1]:.2f}) over {nA} frames, "
+                  f"B=({B[0]:.2f},{B[1]:.2f}) over {nB} frames")
+            print(f"  [gates] gated displacement : {gd:8.2f} cm   "
+                  f"← timing-independent")
+            if args.truth:
+                e = gd - args.truth
+                print(f"  [gates] vs truth {args.truth:.1f} cm: "
+                      f"err {e:+.2f} cm ({100 * e / args.truth:+.1f}%)")
     if args.truth:
         for name, val in [("displacement", disp), ("path length", path)]:
             e = val - args.truth
