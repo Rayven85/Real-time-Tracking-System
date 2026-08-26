@@ -149,6 +149,11 @@ MEASURE_LOG = str(ROOT / "evaluation" / "measurements.csv")
 # scale, for the scale-repeatability study (read → disturb setup → read → …).
 SCALE_LOG = str(ROOT / "evaluation" / "scale_repeatability.csv")
 
+# Marker-survey log ('n' keypress): every detected marker's position and apparent
+# size relative to the camera nadir, for the parallax / radial-distortion study.
+# Both effects grow with distance from the nadir, so radius is the key variable.
+SURVEY_LOG = str(ROOT / "evaluation" / "marker_survey.csv")
+
 
 def _trigger_sign_detection(warped_snap):
     """Fire YOLO in a daemon thread; skip if a run is already in progress."""
@@ -1008,6 +1013,18 @@ def draw_warped(frame, markers, M, saved_mask=None):
             cv2.putText(warped, 'SIGN ROI', (rx1 + 3, ry1 + 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
+    # Camera nadir crosshair ('n' survey origin) — parallax and radial distortion
+    # are both zero here and grow outward, so it's the reference for the survey.
+    if draw_warped._show_nadir:
+        nad = nadir_in_warp(M, frame.shape[1], frame.shape[0])
+        if nad is not None:
+            nx, ny = int(round(nad[0])), int(round(nad[1]))
+            cv2.line(warped, (nx - 18, ny), (nx + 18, ny), (255, 0, 255), 2)
+            cv2.line(warped, (nx, ny - 18), (nx, ny + 18), (255, 0, 255), 2)
+            cv2.circle(warped, (nx, ny), 24, (255, 0, 255), 1)
+            cv2.putText(warped, "(0,0)", (nx + 27, ny - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+
     warped = _draw_dist_overlay(warped)
 
     # 调试：左=俯视图，右=轨道掩膜，按 'm' 切换
@@ -1020,6 +1037,7 @@ def draw_warped(frame, markers, M, saved_mask=None):
 draw_warped._show_mask = False
 draw_warped._show_rois = False
 draw_warped._show_hud  = True   # 'h' toggles info overlays (keeps measurement UI)
+draw_warped._show_nadir = True  # 'x' toggles the camera-nadir crosshair
 
 
 # ── Distance measurement helpers ──────────────────────────────────────
@@ -1147,6 +1165,77 @@ def _log_measurement():
     threading.Thread(target=_prompt_and_write, daemon=True).start()
 
 
+def nadir_in_warp(M, frame_w, frame_h):
+    """
+    Where the camera looks straight down, expressed in warped-view pixels.
+
+    Both error terms under investigation are radial about this point: a marker
+    raised h above the table is pushed outward by H/(H-h), and residual lens
+    distortion also varies with radius. Directly beneath the camera both vanish,
+    so this is the origin the corrections must be measured from.
+
+    Approximated by the frame centre — the saved calibration puts the principal
+    point within 0.4 % of it — projected through the homography.
+    """
+    if M is None:
+        return None
+    p = np.float32([[[frame_w / 2.0, frame_h / 2.0]]])
+    w = cv2.perspectiveTransform(p, M).reshape(2)
+    return float(w[0]), float(w[1])
+
+
+def _log_marker_survey(markers, M, frame_shape):
+    """
+    Append every detected marker to evaluation/marker_survey.csv: its position
+    relative to the camera nadir and its apparent size, both in cm.
+
+    Feeds two experiments (see docs/next_phase_plan.md):
+      • flat marker moved around  → does apparent size grow with radius?
+        (residual radial distortion — the suspected source of the scale offset)
+      • raised marker moved around → does position error grow with radius?
+        (parallax, expected to follow H/(H-h))
+    """
+    if M is None or not (_dist_scale_x and _dist_scale_y):
+        print("[Survey] 需要 4 个角标可见并进入俯视图")
+        return
+    nad = nadir_in_warp(M, frame_shape[1], frame_shape[0])
+    if nad is None:
+        return
+    scale = 0.5 * (_dist_scale_x + _dist_scale_y)   # isotropic after the aspect fix
+
+    is_new = not os.path.exists(SURVEY_LOG)
+    os.makedirs(os.path.dirname(SURVEY_LOG), exist_ok=True)
+    rows = []
+    for mid, (cx, cy, pts) in sorted(markers.items()):
+        wp = cv2.perspectiveTransform(
+            pts.reshape(-1, 1, 2).astype(np.float32), M).reshape(-1, 2)
+        centre = wp.mean(axis=0)
+        # Edge lengths are rotation-invariant; a bounding box would inflate with tilt
+        sides = [float(np.linalg.norm(wp[i] - wp[(i + 1) % 4])) for i in range(4)]
+        size_cm = float(np.mean(sides)) * scale
+        dx_cm = (centre[0] - nad[0]) * scale
+        dy_cm = (centre[1] - nad[1]) * scale
+        rows.append((mid, dx_cm, dy_cm, float(np.hypot(dx_cm, dy_cm)), size_cm))
+
+    if not rows:
+        print("[Survey] 当前没有检测到任何标记")
+        return
+    with open(SURVEY_LOG, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["timestamp", "marker_id", "dx_cm", "dy_cm",
+                             "radius_cm", "apparent_size_cm", "height_cm",
+                             "scale_cmpx", "note"])
+        for mid, dx, dy, r, s in rows:
+            writer.writerow([datetime.now().isoformat(timespec="seconds"), mid,
+                             f"{dx:.2f}", f"{dy:.2f}", f"{r:.2f}", f"{s:.3f}",
+                             _mount_height if _mount_height is not None else "",
+                             f"{scale:.5f}", ""])
+    print(f"[Survey] 记录 {len(rows)} 个标记 → {SURVEY_LOG}")
+    for mid, dx, dy, r, s in rows:
+        print(f"    ID{mid}: 位置({dx:+.1f},{dy:+.1f})cm  半径={r:.1f}cm  表观尺寸={s:.2f}cm")
+
+
 def _log_scale(markers):
     """
     One-key, non-blocking log of the CURRENT ArUco-derived scale to
@@ -1264,7 +1353,8 @@ def main():
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"使用摄像头: {w}x{h}")
-    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  'h'=隐藏文字  'd'=畸变对比  's'=截图  'k'=显示比例  'j'=记比例尺  'p'=测距  'l'=记录测量  't'=记录轨迹  'q'=退出")
+    print("操作: 'w'=透视矫正  'c'=捕获掩膜  'm'=显示掩膜  'r'=ROI框  'h'=隐藏文字  'x'=中心十字  'd'=畸变对比  's'=截图")
+    print("      'k'=显示比例  'j'=记比例尺  'n'=记录标记(实验用)  'p'=测距  'l'=记录测量  't'=记录轨迹  'q'=退出")
 
     # 预计算畸变矫正映射表
     map1, map2, roi = build_undistort_maps(h, w)
@@ -1509,6 +1599,11 @@ def main():
         elif key == ord('t'):
             # Start/stop logging the CAR trajectory (dynamic tracking accuracy)
             _toggle_trajectory()
+        elif key == ord('n'):
+            # Survey every visible marker (position + apparent size vs nadir)
+            _log_marker_survey(markers, M, frame.shape)
+        elif key == ord('x'):
+            draw_warped._show_nadir = not draw_warped._show_nadir
 
     cap.release()
     cv2.destroyAllWindows()
