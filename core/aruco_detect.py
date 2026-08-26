@@ -162,10 +162,15 @@ def _trigger_sign_detection(warped_snap):
         return
     _sign_running = True
     def _run():
+        # finally: an exception here would otherwise leave _sign_running True
+        # forever, silently stopping all further sign detection.
         global _sign_running
-        result = detect_signs(warped_snap)
-        _sign_result[0] = result
-        _sign_running = False
+        try:
+            _sign_result[0] = detect_signs(warped_snap)
+        except Exception as e:
+            print(f"[YOLO] 检测线程出错: {e}")
+        finally:
+            _sign_running = False
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -186,7 +191,7 @@ def list_cameras(max_index=5):
         if cap.isOpened():
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap.release()
+            release_camera(cap)   # timed — a plain release can hang here too
             time.sleep(0.3)   # let macOS release the device before next open
             print(f"  [{i}] {w}x{h}")
     print()
@@ -212,11 +217,74 @@ def open_camera(source, retries=5):
             return cap
 
         print(f"  [attempt {attempt}/{retries}] 推流未就绪，3s 后重试…")
-        cap.release()
+        release_camera(cap)
         time.sleep(3.0)
 
     print(f"无法打开摄像头 {source}（已重试 {retries} 次）")
     return None
+
+
+class FrameGrabber:
+    """
+    Reads the camera on a daemon thread and publishes the newest frame.
+
+    cv2's read() does not merely return False when a GoPro stops delivering
+    frames on macOS — it can block forever, which freezes the whole UI: no
+    display, no keys, only Ctrl-C. Confining that call to its own thread keeps
+    the main loop responsive, so a stall becomes a visible warning the operator
+    can quit out of cleanly rather than a hang that leaves the device claimed.
+
+    Each frame carries a timestamp: the main loop processes a frame only when it
+    is new (no duplicate trajectory samples) and can see how stale it has gone.
+    """
+
+    def __init__(self, cap):
+        self._cap = cap
+        self._frame = None
+        self._stamp = 0.0
+        self._lock = threading.Lock()
+        self._stop = False
+        self.fail_streak = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while not self._stop:
+            try:
+                ret, f = self._cap.read()
+            except Exception:
+                ret, f = False, None
+            if ret and f is not None:
+                with self._lock:
+                    self._frame = f
+                    self._stamp = time.perf_counter()
+                    self.fail_streak = 0
+            else:
+                self.fail_streak += 1
+                time.sleep(0.01)      # failed read: don't spin the CPU
+
+    def read(self):
+        """Return (frame, stamp); stamp is 0.0 until the first frame arrives."""
+        with self._lock:
+            return self._frame, self._stamp
+
+    def stop(self):
+        self._stop = True
+
+
+def release_camera(cap, timeout=1.0):
+    """
+    Release the capture without risking a hang on exit.
+
+    cap.release() can block indefinitely with a GoPro on macOS, which is why the
+    original code skipped it and called os._exit — but then the device stays
+    claimed and the next run cannot open it. Releasing on a thread gets the
+    device freed in the normal case while still guaranteeing we exit.
+    """
+    if cap is None:
+        return
+    t = threading.Thread(target=cap.release, daemon=True)
+    t.start()
+    t.join(timeout)
 
 
 def build_undistort_maps(h, w):
@@ -1341,14 +1409,18 @@ def main():
         print("  python aruco_detect.py --source 0")
         return
 
-    # On macOS, cap.release() for GoPro blocks indefinitely.
-    # Install a SIGINT handler so Ctrl+C always exits immediately.
-    signal.signal(signal.SIGINT, lambda *_: os._exit(0))
-
     cap = open_camera(args.source)
     if cap is None:
         print(f"无法打开摄像头 {args.source}")
         return
+
+    # Ctrl+C must always exit, but it should still hand the device back — an
+    # abrupt os._exit leaves the GoPro claimed and the next run can't open it.
+    def _sigint(*_):
+        print("\n已中断，正在释放摄像头…")
+        release_camera(cap)
+        os._exit(0)
+    signal.signal(signal.SIGINT, _sigint)
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1370,24 +1442,29 @@ def main():
     saved_mask = None   # auto-detected track mask
     _M_stable_frames = 0
     _first_detect_done = False
-    _read_failures = 0
-    _MAX_FAILURES = 300
     def _run_mask_detection(warped_snap, car_pos_snap, M_snap):
         """Run YOLO then mask in one background thread — guarantees fresh sign positions."""
+        # finally: without it an exception leaves _mask_running (and possibly
+        # _sign_running) stuck True, permanently disabling both re-detections.
         global _mask_running, _mask_M, _sign_running
-        # Step 1: fresh YOLO — gives accurate sign positions for tape blanking
-        fresh = detect_signs(warped_snap)
-        _sign_result[0] = fresh   # let main loop pick up updated sign state
-        _sign_running = False
-        # Step 2: mask with guaranteed-fresh boxes
-        result = auto_detect_track_mask(warped_snap, car_pos_snap, fresh['boxes'])
-        _mask_result[0] = result
-        if result is not None:
-            _mask_M = M_snap
-            print("✓ 轨道掩膜已更新")
-        else:
-            print("[Auto] 轨道识别失败，请检查光照或按 'c' 重试")
-        _mask_running = False
+        try:
+            # Step 1: fresh YOLO — gives accurate sign positions for tape blanking
+            fresh = detect_signs(warped_snap)
+            _sign_result[0] = fresh   # let main loop pick up updated sign state
+            _sign_running = False
+            # Step 2: mask with guaranteed-fresh boxes
+            result = auto_detect_track_mask(warped_snap, car_pos_snap, fresh['boxes'])
+            _mask_result[0] = result
+            if result is not None:
+                _mask_M = M_snap
+                print("✓ 轨道掩膜已更新")
+            else:
+                print("[Auto] 轨道识别失败，请检查光照或按 'c' 重试")
+        except Exception as e:
+            print(f"[Auto] 掩膜线程出错: {e}")
+        finally:
+            _sign_running = False
+            _mask_running = False
 
     def _trigger_mask(warped_now, markers_now):
         """Snapshot current frame and kick off background detection (non-blocking)."""
@@ -1410,16 +1487,31 @@ def main():
     cv2.namedWindow("ArUco Detection")
     cv2.setMouseCallback("ArUco Detection", _on_mouse)
 
+    grabber = FrameGrabber(cap)
+    last_stamp = 0.0
+    STALL_SEC = 2.0          # no new frame for this long → warn, keep UI alive
+
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            _read_failures += 1
-            if _read_failures >= _MAX_FAILURES:
-                print(f"摄像头连续丢帧 {_MAX_FAILURES} 次，退出")
-                break
-            cv2.waitKey(1)   # keep UI responsive, no sleep — GoPro needs continuous reads
+        frame, stamp = grabber.read()
+        now = time.perf_counter()
+
+        # No new frame: keep the window and keys alive instead of blocking.
+        if frame is None or stamp == last_stamp:
+            stalled_for = now - stamp if stamp else now - t_start
+            if stalled_for > STALL_SEC:
+                warn = np.zeros((160, 760, 3), dtype=np.uint8)
+                cv2.putText(warn, "CAMERA STALLED", (20, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
+                cv2.putText(warn, f"no frame for {stalled_for:.0f}s - press 'q' to quit",
+                            (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.imshow("ArUco Detection", warn)
+            if (cv2.waitKey(30) & 0xFF) == ord('q'):
+                grabber.stop()
+                release_camera(cap)
+                cv2.destroyAllWindows()
+                os._exit(0)
             continue
-        _read_failures = 0
+        last_stamp = stamp
 
         frame_count += 1
         elapsed = time.perf_counter() - t_start
@@ -1539,8 +1631,10 @@ def main():
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord('q'):
+            grabber.stop()
+            release_camera(cap)   # timed: frees the device, never hangs the exit
             cv2.destroyAllWindows()
-            os._exit(0)   # cap.release() hangs on macOS+GoPro; exit immediately
+            os._exit(0)
         elif key == ord('w'):
             show_warp = not show_warp
             if not show_warp:       # leaving warp view — cancel any active dist mode
@@ -1605,7 +1699,8 @@ def main():
         elif key == ord('x'):
             draw_warped._show_nadir = not draw_warped._show_nadir
 
-    cap.release()
+    grabber.stop()
+    release_camera(cap)
     cv2.destroyAllWindows()
 
 
