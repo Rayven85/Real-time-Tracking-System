@@ -747,6 +747,25 @@ The parallax term is expected and fully explained: the homography maps to the ta
 
 **Residual speed trend.** Measured displacement rises ~1.1 cm from the slow to the fast group. This is most likely the robot's own stopping behaviour — overshooting the end mark further at higher speed — rather than a tracking effect, since the cross-track RMS moves in the opposite direction.
 
+### Eliminating the Offset — Root Cause and Result
+
+Both terms were traced and corrected; the offset is now **+0.28 cm on a 94 cm path (+0.30%)**, an 11× reduction.
+
+**The scale term was a lever-arm problem, not a marker problem.** cm/px was derived from a corner marker's 10.5 cm edge — a feature only ~37 px across — and then applied over the full 600 px field, multiplying any local error ~16×. Measured against tape the error was **5.7% in x but 2.4% in y**, so not even a single factor. A survey (`n` key → `evaluation/survey_eval.py`) showed why: a flat marker images as **10.22 cm at the centre of the field and 10.51 cm at the corners** although both are physically 10.5 cm. The markers themselves were verified correct — 10.5 cm, flat, coplanar with the reference marks — and radial distortion was ruled out (apparent size is flat with radius, −0.07% per 10 cm).
+
+The fix removes the lever arm. The homography always maps the corner-marker centres onto the corners of the warped rectangle, so **one tape measurement of each centre-to-centre distance fixes cm/px exactly** (`--baseline-x`, `--baseline-y`) — over a 181 cm baseline instead of 10.5 cm, diluting the same absolute error ~17×. Being a constant, it also stops the scale drifting, and the aspect lock derived from it gives genuinely square pixels (sx and sy agree to 0.01%).
+
+**The parallax term is geometric** (`--marker-height`). The car marker rides 11 cm above the plane the homography maps, so it is seen along a slanted ray and lands too far out — by H/(H−h), measured outward from the point directly beneath the camera, hence nil there and growing toward the edges. Scaling the offset from that point by (H−h)/H undoes it. The survey validated the model independently: the marker imaged 8.64% larger raised than flat, giving h = 11.6 cm against 11 cm on a ruler.
+
+**Verification (4 runs, 5.3–10.4 cm/s):**
+
+| | Offset vs 94 cm | 1σ |
+|---|---|---|
+| Before | +3.12 cm | 0.62 cm |
+| **After** | **+0.28 cm** | **0.10 cm** |
+
+**The result is also robust to moving the camera.** The scale is immune by construction — the homography pins the marker centres to the warped rectangle whatever the viewpoint, confirmed exact in simulation under a 26 cm drop, a 34 cm rise and an 8° tilt. The parallax term needs H, so H is tracked live from the corner markers' separation in the original image, which varies as 1/H (anchored once against the measured `--height`). Only relocating the markers requires re-measuring the baselines — absolute scale must come from one physical measurement.
+
 ---
 
 ## Next Steps
@@ -757,8 +776,10 @@ The parallax term is expected and fully explained: the homography maps to the ta
 1. **(Accuracy improvement — beyond Kevin's ask)** Enable lens undistortion via a webcam-mode recalibration to remove the setup-dependent 1–3% trueness offset and the peripheral errors; or apply a one-time tape calibration per fixed setup.
 2. **Tighter precision-vs-height validation** is blocked by the fixed mount (130–146 cm only); it would need a rig with a wider adjustable range.
 
-**Robot / dynamic tracking — delivered (see Dynamic Tracking Accuracy):**
-4. Remaining threads: identify the source of the −5.11% scale offset; extend the speed range beyond 11 cm/s and to curved paths; mount the marker lower (or divide by H/(H−h)) to remove the parallax term.
+**Robot / dynamic tracking — delivered, offset eliminated (see Dynamic Tracking Accuracy):**
+4. Remaining: extend the speed range beyond 11 cm/s and to curved paths; automate run start/stop to remove the manual-keypress timing spread.
+
+**Multi-car sign compliance (next, per Kevin):** track several cars by marker ID, associate each with the nearby sign, and judge compliance — did the car actually stop at STOP, slow for the speed sign, or drive straight through? Sign detection already reports position and class; `CAR_ID` is currently a single hard-coded id and the `STOP_SPEED_THRESHOLD` / `_stop_event` compliance logic is still a stub. Design in [docs/next_phase_plan.md](docs/next_phase_plan.md).
 
 **System / deployment:**
 5. Decide default `WARP_BASE` for real-time (600) vs. measurement (≈1520) use; document the FPS trade-off.
