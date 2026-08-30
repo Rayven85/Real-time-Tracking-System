@@ -118,6 +118,21 @@ ARUCO_REAL_SIZE_CM = 10.5
 # evaluation/scale_repeatability.csv).
 SCALE_CALIBRATION = 1.0
 
+# ── Baseline calibration (--baseline-x / --baseline-y) ────────────────
+# Preferred way to fix the scale. Deriving cm/px from a marker's 10.5 cm edge
+# means reading a ~37 px feature and extrapolating it across a 600 px field, so
+# any local error is multiplied ~16x; measured against tape the result came out
+# 5.7 % short in x and 2.4 % in y — not even a single factor, because a marker's
+# imaged size varies across the field (a flat marker read 10.22 cm at the centre
+# and 10.51 cm at the corners).
+#
+# The homography always maps the corner-marker centres onto the corners of the
+# warped rectangle, so one tape measurement of the centre-to-centre distance
+# fixes cm/px exactly, over a 181 cm baseline instead of 10.5 cm — the same
+# absolute error diluted ~17x. It is also constant, so the scale stops drifting.
+_baseline_x = None    # tape cm, ID0 centre → ID1 centre (spans WARP_W)
+_baseline_y = None    # tape cm, ID0 centre → ID3 centre (spans WARP_H)
+
 _dist_mode    = False      # True while user is clicking measurement points
 _dist_pt_a    = None       # first click in warped 600×600 space
 _dist_pt_b    = None       # second click
@@ -125,6 +140,7 @@ _dist_scale_x = None       # cm per pixel along x-axis (auto-derived)
 _dist_scale_y = None       # cm per pixel along y-axis (auto-derived)
 _logging_busy = False      # True while a background 'l' prompt is awaiting input
 _mount_height = None       # camera height above table (cm); set via --height, logged by 'j'
+_marker_height = None      # car marker height above the table (cm); enables parallax correction
 
 # ── CAR detection-rate monitor ────────────────────────────────────────
 # The corner markers get EMA smoothing + persistence (_stabilise_corners), so
@@ -451,6 +467,11 @@ def _lock_aspect_ratio(sx, sy):
     on-screen view is geometrically faithful.  Called once, then frozen.
     """
     global WARP_W, WARP_H, _aspect_locked
+    # Tape baselines describe the same two spans (they ARE the rectangle edges),
+    # so when available they set the ratio directly and the marker estimate — the
+    # weaker of the two — is not consulted at all.
+    if _baseline_x and _baseline_y:
+        sx, sy = _baseline_x, _baseline_y
     if not sx or not sy or sx <= 0 or sy <= 0:
         return False
     if sx >= sy:                       # x is the longer / coarser axis
@@ -981,6 +1002,10 @@ def draw_warped(frame, markers, M, saved_mask=None):
     if CAR_ID in markers:
         cx, cy, _ = markers[CAR_ID]
         wx, wy = warp_point((cx, cy), M)
+        # The car marker sits above the table, so pull it back onto the plane
+        # before it is displayed, measured or logged.
+        wxf, wyf = correct_parallax(wx, wy, M, frame.shape)
+        wx, wy = int(round(wxf)), int(round(wyf))
         if 0 <= wx < WARP_W and 0 <= wy < WARP_H:
             # Trajectory logging: append this frame's position while recording
             if _traj_recording and _dist_scale_x and _dist_scale_y:
@@ -1252,6 +1277,29 @@ def nadir_in_warp(M, frame_w, frame_h):
     return float(w[0]), float(w[1])
 
 
+def correct_parallax(wx, wy, M, frame_shape):
+    """
+    Project a raised marker back onto the table plane.
+
+    The homography maps the table plane, so a marker riding h above it is seen
+    along a slanted ray and lands too far out — by H/(H-h), measured outward from
+    the point directly under the camera, which is why the error is nil there and
+    grows toward the edges. Scaling the offset from the nadir by (H-h)/H undoes
+    it. Survey confirmed the model: the car marker imaged 8.64 % larger raised
+    than flat, giving h = 11.6 cm against 11 cm on a ruler.
+
+    Needs --marker-height and --height; without either the position is unchanged.
+    """
+    if not (_marker_height and _mount_height) or M is None:
+        return wx, wy
+    nad = nadir_in_warp(M, frame_shape[1], frame_shape[0])
+    if nad is None:
+        return wx, wy
+    k = (_mount_height - _marker_height) / _mount_height
+    return (nad[0] + (wx - nad[0]) * k,
+            nad[1] + (wy - nad[1]) * k)
+
+
 def _log_marker_survey(markers, M, frame_shape):
     """
     Append every detected marker to evaluation/marker_survey.csv: its position
@@ -1384,7 +1432,8 @@ def _toggle_trajectory():
 def main():
     # Rectified-view resolution is overridable at launch; declare the globals up
     # front (before the argparse default reads WARP_BASE).
-    global WARP_BASE, WARP_W, WARP_H, _mount_height
+    global WARP_BASE, WARP_W, WARP_H, _mount_height, _marker_height
+    global _baseline_x, _baseline_y
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=int, default=None,
@@ -1393,7 +1442,27 @@ def main():
                         help="俯视图长边像素（默认600；测量研究可调大如1520，更细但更慢）")
     parser.add_argument("--height", type=float, default=None,
                         help="相机镜头到桌面高度(cm)，精密度-高度扫描用；按 'j' 记录时写入 height_cm 列")
+    parser.add_argument("--baseline-x", type=float, default=None,
+                        help="卷尺量的 ID0→ID1 中心距(cm)；用长基线定标比例尺，比用码尺寸准得多")
+    parser.add_argument("--baseline-y", type=float, default=None,
+                        help="卷尺量的 ID0→ID3 中心距(cm)；需与 --baseline-x 同时给出")
+    parser.add_argument("--marker-height", type=float, default=None,
+                        help="车标离桌面的高度(cm)，开启视差修正；需同时给 --height")
     args = parser.parse_args()
+
+    _marker_height = args.marker_height
+    if _marker_height and not args.height:
+        print("[Parallax] 给了 --marker-height 但没给 --height，视差修正未启用")
+    elif _marker_height:
+        k = (args.height - _marker_height) / args.height
+        print(f"[Parallax] 视差修正已启用: 车标高 {_marker_height}cm / 相机高 {args.height}cm "
+              f"→ 系数 {k:.4f}")
+
+    if bool(args.baseline_x) != bool(args.baseline_y):
+        print("[Scale] --baseline-x 和 --baseline-y 必须同时给出，本次忽略")
+    elif args.baseline_x:
+        _baseline_x, _baseline_y = args.baseline_x, args.baseline_y
+        print(f"[Scale] 长基线定标: x={_baseline_x}cm  y={_baseline_y}cm")
 
     # Higher WARP_BASE = finer measurement quantisation (approaches the camera
     # GSD) at the cost of FPS; the mask still runs at the fixed MASK_DIM canvas,
@@ -1566,7 +1635,13 @@ def main():
                     saved_mask = None                              # geometry changed → re-detect
                     _first_detect_done = False
 
-            if sx is not None:
+            if _baseline_x and _baseline_y and _aspect_locked:
+                # The homography pins the marker centres to the rectangle corners,
+                # so the tape baselines give cm/px outright — exact, and constant,
+                # so it neither drifts nor needs smoothing.
+                _dist_scale_x = _baseline_x / WARP_W
+                _dist_scale_y = _baseline_y / WARP_H
+            elif sx is not None:
                 if _dist_scale_x is None:
                     _dist_scale_x, _dist_scale_y = sx, sy          # first frame: init directly
                 else:
