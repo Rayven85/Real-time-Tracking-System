@@ -142,6 +142,18 @@ _logging_busy = False      # True while a background 'l' prompt is awaiting inpu
 _mount_height = None       # camera height above table (cm); set via --height, logged by 'j'
 _marker_height = None      # car marker height above the table (cm); enables parallax correction
 
+# Live camera height, so the parallax term follows the rig instead of trusting a
+# number typed once. The corner markers are a fixed physical distance apart, so
+# their separation in the ORIGINAL image varies as 1/H: anchor that product
+# against the measured --height once and H can be read off it every frame.
+# The long baseline is used rather than a marker's own 10.5 cm edge because the
+# imaged size of a marker is not reliable enough — it reads 10.22 cm at the
+# centre of the field and 10.51 cm at the corners, which would put h anywhere
+# between 8 and 15 cm.
+_h_anchor = None           # H0 * baseline_px at the anchoring frame
+_h_live = None             # current camera height (cm), tracked from the baseline
+H_TRACK_ALPHA = 0.05       # heavy smoothing: H is physically near-constant
+
 # ── CAR detection-rate monitor ────────────────────────────────────────
 # The corner markers get EMA smoothing + persistence (_stabilise_corners), so
 # their flicker is hidden; the car marker is deliberately raw — smoothing it
@@ -1277,6 +1289,33 @@ def nadir_in_warp(M, frame_w, frame_h):
     return float(w[0]), float(w[1])
 
 
+def track_camera_height(markers):
+    """
+    Follow the camera height from the corner markers' separation in the original
+    image, so moving the rig doesn't silently invalidate the parallax term.
+
+    ID0 and ID1 are a fixed distance apart on the table, so their pixel
+    separation scales as 1/H. The first stable frame anchors H0 * px against the
+    measured --height; from then on H = anchor / px. Raise the camera and the
+    markers draw closer together, and H rises to match.
+    """
+    global _h_anchor, _h_live
+    if not _mount_height or 0 not in markers or 1 not in markers:
+        return _h_live
+    px = float(np.hypot(markers[0][0] - markers[1][0],
+                        markers[0][1] - markers[1][1]))
+    if px < 1:
+        return _h_live
+    if _h_anchor is None:
+        _h_anchor = _mount_height * px
+        _h_live = _mount_height
+        return _h_live
+    h_new = _h_anchor / px
+    _h_live = (H_TRACK_ALPHA * h_new + (1 - H_TRACK_ALPHA) * _h_live
+               if _h_live else h_new)
+    return _h_live
+
+
 def correct_parallax(wx, wy, M, frame_shape):
     """
     Project a raised marker back onto the table plane.
@@ -1290,12 +1329,13 @@ def correct_parallax(wx, wy, M, frame_shape):
 
     Needs --marker-height and --height; without either the position is unchanged.
     """
-    if not (_marker_height and _mount_height) or M is None:
+    H = _h_live or _mount_height          # tracked height, else the typed one
+    if not (_marker_height and H) or M is None:
         return wx, wy
     nad = nadir_in_warp(M, frame_shape[1], frame_shape[0])
     if nad is None:
         return wx, wy
-    k = (_mount_height - _marker_height) / _mount_height
+    k = (H - _marker_height) / H
     return (nad[0] + (wx - nad[0]) * k,
             nad[1] + (wy - nad[1]) * k)
 
@@ -1623,6 +1663,7 @@ def main():
         if all(i in markers for i in [0, 1, 2, 3]):
             M = get_perspective_transform(markers)
             _M_stable_frames += 1
+            track_camera_height(markers)   # keeps the parallax term current
             sx, sy = compute_scale_from_aruco(markers, M)
 
             # Once the corners are stable, lock the rectified view to the real
@@ -1698,6 +1739,8 @@ def main():
             cv2.putText(display, f"Detect: {car_rate:.0f}% (last {len(_car_hits)}f)",
                         (10, 109), cv2.FONT_HERSHEY_SIMPLEX, 0.6, rate_color, 2)
             mode_text = "Mode: Warp" if (show_warp and M is not None) else "Mode: Raw"
+            if _h_live and _marker_height:
+                mode_text += f"  H:{_h_live:.0f}cm"
             cv2.putText(display, mode_text, (10, 136),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
